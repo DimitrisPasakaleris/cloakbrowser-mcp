@@ -13,6 +13,7 @@ os.environ["CLOAK_MCP_HOME"] = str(ROOT / ".testhome")
 os.environ["CLOAK_HUMANIZE"] = "0"  # keep tests fast
 os.environ["CLOAK_HEADLESS"] = "1"
 os.environ["CLOAK_ALLOW_PRIVATE"] = "1"  # the test site is on loopback
+os.environ["CLOAK_MEMORY_NEVER_ASK"] = "1"  # keep the "memory is off" hint out of unrelated tests
 
 
 class Handler(http.server.SimpleHTTPRequestHandler):
