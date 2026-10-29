@@ -1,4 +1,4 @@
-﻿# cloakbrowser-mcp
+# cloakbrowser-mcp
 
 An [MCP](https://modelcontextprotocol.io) server that gives Claude (or any MCP client) a stealth browser. It wraps
 [CloakBrowser](https://github.com/CloakHQ/CloakBrowser), a patched Chromium that passes common bot checks, and exposes
@@ -9,7 +9,7 @@ An [MCP](https://modelcontextprotocol.io) server that gives Claude (or any MCP c
 Requires Python 3.10+. The ~200 MB browser binary downloads on first launch and is cached in `~/.cloakbrowser`.
 
 ```bash
-pip install cloakbrowser-mcp          # or: pip install git+https://github.com/DimitrisPasakaleris/cloakbrowser-mcp
+pip install git+https://github.com/DimitrisPasakaleris/cloakbrowser-mcp
 python -m cloakbrowser install        # optional: pre-download the browser binary
 ```
 
@@ -29,7 +29,7 @@ claude mcp add cloakbrowser -s user -- cloakbrowser-mcp
 }
 ```
 
-With `uv`: `claude mcp add cloakbrowser -s user -- uvx cloakbrowser-mcp`.
+With `uv`: `claude mcp add cloakbrowser -s user -- uvx --from git+https://github.com/DimitrisPasakaleris/cloakbrowser-mcp cloakbrowser-mcp`.
 
 ## Typical flow
 
