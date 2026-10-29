@@ -1,3 +1,3 @@
-"""MCP server exposing CloakBrowser stealth Chromium as tools."""
+﻿"""MCP server exposing CloakBrowser stealth Chromium as tools."""
 
-__version__ = "0.2.0"
+__version__ = "0.3.0"
