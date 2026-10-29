@@ -1,0 +1,11 @@
+<!doctype html><html><head><meta charset="utf-8"><title>Frames</title></head><body>
+<div id="result">none</div>
+<div id="box"><button id="inbox" onclick="document.getElementById('result').textContent='box-clicked'">Box Btn</button></div>
+<button id="outside">Outside Btn</button>
+<div id="host"></div>
+<iframe src="/inner.html" width="300" height="100" title="inner"></iframe>
+<script>
+const root = document.getElementById('host').attachShadow({mode: 'open'});
+root.innerHTML = '<button id="sb">Shadow Btn</button>';
+root.getElementById('sb').onclick = () => { document.getElementById('result').textContent = 'shadow-clicked'; };
+</script></body></html>

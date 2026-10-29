@@ -5,7 +5,7 @@ build-backend = "hatchling.build"
 [project]
 name = "cloakbrowser-mcp"
 dynamic = ["version"]
-description = "MCP server that exposes CloakBrowser stealth Chromium as 39 browser-automation tools"
+description = "MCP server that exposes CloakBrowser stealth Chromium as 49 browser-automation tools"
 readme = "README.md"
 license = { text = "MIT" }
 requires-python = ">=3.10"

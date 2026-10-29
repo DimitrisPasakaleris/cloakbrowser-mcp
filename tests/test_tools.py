@@ -3,6 +3,7 @@ import re
 from pathlib import Path
 
 import pytest
+from helpers import U
 
 pytestmark = pytest.mark.asyncio(loop_scope="session")
 
@@ -31,9 +32,9 @@ async def test_snapshot_and_ref_click(srv):
 
 
 async def test_extract_links_structured(srv):
-    links = json.loads(await srv.extract_links(pattern="page2"))
+    links = json.loads(U(await srv.extract_links(pattern="page2")))
     assert len(links) == 1 and links[0]["href"].endswith("/page2.html")  # unique
-    res = json.loads(await srv.extract_structured("li.card", {"name": "h2", "price": ".price", "url": "a@href"}))
+    res = json.loads(U(await srv.extract_structured("li.card", {"name": "h2", "price": ".price", "url": "a@href"})))
     assert res["count"] == 3
     assert res["items"][0]["name"] == "Alpha gummies" and res["items"][0]["price"] == "10,50 €"
     assert res["items"][1]["url"].endswith("/b")
@@ -88,17 +89,17 @@ async def test_console_capture(srv, base_url):
     await srv.navigate(base_url + "/index.html")
     await srv.evaluate("() => { console.warn('w1'); setTimeout(() => { throw new Error('boom') }, 0) }")
     await srv.wait_for(timeout_ms=300)
-    logs = json.loads(await srv.console_logs())
+    logs = json.loads(U(await srv.console_logs()))
     texts = [e["text"] for e in logs]
     assert "hello-console" in texts and "w1" in texts and any("boom" in t for t in texts)
-    assert json.loads(await srv.console_logs(clear=True)) and json.loads(await srv.console_logs()) == []
+    assert json.loads(U(await srv.console_logs(clear=True))) and json.loads(U(await srv.console_logs())) == []
     await srv.configure(capture_console=False)  # restarts the browser
     await srv.navigate(base_url + "/index.html")
 
 
 async def test_evaluate_and_screenshot(srv):
-    assert await srv.evaluate("1+2") == "3"
-    assert await srv.evaluate("() => document.title") == '"Test Shop"'
+    assert U(await srv.evaluate("1+2")) == "3"
+    assert U(await srv.evaluate("() => document.title")) == '"Test Shop"'
     img = await srv.screenshot()
     assert img.data[:4] == b"\x89PNG"
     el = await srv.screenshot(selector="h1")

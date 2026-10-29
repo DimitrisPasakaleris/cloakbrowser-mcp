@@ -1,4 +1,3 @@
-import functools
 import http.server
 import os
 import sys
@@ -13,13 +12,35 @@ sys.path.insert(0, str(ROOT))
 os.environ["CLOAK_MCP_HOME"] = str(ROOT / ".testhome")
 os.environ["CLOAK_HUMANIZE"] = "0"  # keep tests fast
 os.environ["CLOAK_HEADLESS"] = "1"
+os.environ["CLOAK_ALLOW_PRIVATE"] = "1"  # the test site is on loopback
+
+
+class Handler(http.server.SimpleHTTPRequestHandler):
+    def __init__(self, *a, **kw):
+        super().__init__(*a, directory=str(ROOT / "tests" / "site"), **kw)
+
+    def log_message(self, *a, **k):
+        pass
+
+    def do_GET(self):
+        if self.path.startswith("/challenge"):
+            body = b"<html><head><title>Just a moment...</title></head><body>checking your browser</body></html>"
+            self.send_response(403)
+            self.send_header("Content-Type", "text/html")
+            self.send_header("Content-Length", str(len(body)))
+            self.end_headers()
+            self.wfile.write(body)
+        elif self.path.startswith("/redir"):
+            self.send_response(302)
+            self.send_header("Location", f"http://localhost:{self.server.server_address[1]}/page2.html")
+            self.end_headers()
+        else:
+            super().do_GET()
 
 
 @pytest.fixture(scope="session")
 def base_url():
-    handler = functools.partial(http.server.SimpleHTTPRequestHandler, directory=str(ROOT / "tests" / "site"))
-    handler.func.log_message = lambda *a, **k: None
-    srv = http.server.ThreadingHTTPServer(("127.0.0.1", 0), handler)
+    srv = http.server.ThreadingHTTPServer(("127.0.0.1", 0), Handler)
     threading.Thread(target=srv.serve_forever, daemon=True).start()
     yield f"http://127.0.0.1:{srv.server_address[1]}"
     srv.shutdown()
