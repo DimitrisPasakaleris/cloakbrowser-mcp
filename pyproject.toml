@@ -1,0 +1,30 @@
+[build-system]
+requires = ["hatchling"]
+build-backend = "hatchling.build"
+
+[project]
+name = "cloakbrowser-mcp"
+dynamic = ["version"]
+description = "MCP server that exposes CloakBrowser stealth Chromium as 39 browser-automation tools"
+readme = "README.md"
+license = { text = "MIT" }
+requires-python = ">=3.10"
+keywords = ["mcp", "model-context-protocol", "browser", "scraping", "playwright", "claude"]
+classifiers = [
+  "Programming Language :: Python :: 3",
+  "License :: OSI Approved :: MIT License",
+  "Topic :: Internet :: WWW/HTTP :: Browsers",
+]
+dependencies = ["cloakbrowser", "mcp>=1.2,<2"]
+
+[project.optional-dependencies]
+dev = ["pytest", "pytest-asyncio"]
+
+[project.scripts]
+cloakbrowser-mcp = "cloakbrowser_mcp.server:main"
+
+[tool.hatch.version]
+path = "cloakbrowser_mcp/__init__.py"
+
+[tool.hatch.build.targets.sdist]
+include = ["cloakbrowser_mcp", "tests", "README.md", "LICENSE", "e2e.py", "pytest.ini"]
