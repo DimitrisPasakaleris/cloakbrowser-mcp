@@ -244,6 +244,7 @@ python -m venv .venv && .venv/bin/pip install -e ".[dev]"     # Windows: .venv\S
 pytest -q                 # 220+ tests against a local static site and the MCP protocol
 python e2e.py             # stdio MCP client against live Skroutz (needs network)
 python e2e_memory.py      # consent prompt + memory over real MCP stdio, in a temp home
+python prompt_tests/run_prompts.py   # 10 real-agent prompts (Codex) checked against ground truth; PROMPTS.md has them to paste by hand
 python e2e_learning.py    # default-on memory: notice, learned pop-ups / load strategy / extractors, persistence, disable
 python e2e_savings.py     # lean profile, read_url/run_steps, scaled screenshots, usage log, opt-in memory tools
 python bench_tokens.py URL...   # before/after token estimates on real pages
