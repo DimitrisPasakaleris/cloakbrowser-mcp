@@ -449,3 +449,32 @@ async def test_stats_cli_end_to_end(tmp_path, monkeypatch, capsys):
     assert stats.main(["--no-defs"]) == 0 and "get_markdown" in capsys.readouterr().out
     assert stats.main(["--reset"]) == 0 and not (logdir / "usage.jsonl").exists()
     assert stats.main(["--no-defs"]) == 0 and "nothing logged" in capsys.readouterr().out
+
+
+async def test_stats_reports_site_memory(tmp_path, monkeypatch, capsys):
+    from cloakbrowser_mcp import stats
+    from cloakbrowser_mcp.memory import Memory
+
+    monkeypatch.setenv("CLOAK_MCP_HOME", str(tmp_path))
+    monkeypatch.delenv("CLOAK_MEMORY", raising=False)
+    monkeypatch.delenv("CLOAK_MEMORY_DEFAULT", raising=False)
+    assert stats.main(["--no-defs"]) == 0
+    out = capsys.readouterr().out
+    assert "Site memory: on (default, standard)" in out and "nothing learned yet" in out
+    mem = Memory(tmp_path / "memory", default_on=True)
+    mem.record_navigation("https://shop.example.com/c/1/x", 200, False, 10, "c", False, 0)
+    mem.record_overlay("https://shop.example.com/", "#accept", True)
+    mem.record_overlay("https://shop.example.com/", "#accept", True, True)
+    mem.store().close()
+    assert stats.main(["--no-defs"]) == 0
+    out = capsys.readouterr().out
+    assert "1 site load playbooks" in out and "1 pop-up dismissers" in out and "applied overlay: 1x, 1 worked, ~250 tokens saved" in out
+    assert "#accept" not in out  # numbers only
+    assert stats.main(["--no-defs", "--json"]) == 0
+    import json as _json
+
+    data = _json.loads(capsys.readouterr().out)
+    assert data["memory"]["enabled"] is True and data["memory"]["learned"]["impact"]["overlay"]["ok"] == 1
+    assert stats.main(["--no-defs", "--no-memory"]) == 0 and "Site memory" not in capsys.readouterr().out
+    monkeypatch.setenv("CLOAK_MEMORY", "off")
+    assert stats.main(["--no-defs"]) == 0 and "Site memory: off" in capsys.readouterr().out

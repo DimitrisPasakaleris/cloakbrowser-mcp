@@ -3,7 +3,7 @@
 An [MCP](https://modelcontextprotocol.io) server that gives Claude (or any MCP client) a stealth browser. It wraps
 [CloakBrowser](https://github.com/CloakHQ/CloakBrowser), a patched Chromium that passes common bot checks, and exposes
 61 tools for navigation, reading, extraction, interaction, sessions, identity control, debugging and
-(optional, opt-in) per-site memory.
+per-site memory that learns (on by default, local, one switch to turn off).
 
 ## Install
 
@@ -108,45 +108,83 @@ fields = {"name": "h2", "price": ".price", "url": "a@href"}
 - `configure(headless=False)` + `request_human()` lets you solve a captcha in a real window. This server does not
   use captcha-solving services.
 
-## Memory (off by default, opt-in)
+## Memory (on by default, local, and it learns)
 
-The server can learn from browsing and get better at sites you revisit, **but only if you say yes, and only for the
-things you pick.** Until then no file is created and nothing is recorded.
+The server remembers how each site behaves and gets better at the ones you revisit. Since 0.5 this is **on by default
+with the standard preset**, because it only helps if it is running; it is local, it never stores page text, cookies or
+form values, and it is one setting to turn off:
 
-**How you are asked.** The assistant can call `memory_request_access`. Your client then shows its own form (MCP
-elicitation), which the model cannot fill in for you. If your client cannot show forms, the tool tells you to run
-`cloakbrowser-mcp memory setup` in a terminal. Declining, timing out or any error leaves memory **off**. You can
-also pre-authorise it yourself in the MCP registration with `CLOAK_MEMORY=standard`.
+```
+CLOAK_MEMORY=off                       # in the MCP registration (env var), or
+cloakbrowser-mcp memory disable        # from a terminal: also deletes what was learned
+CLOAK_MEMORY_DEFAULT=off               # keep the old behaviour: nothing is on until you opt in
+```
+
+The first `navigate` of a fresh install says so once ("MEMORY IS ON by default ..."), then never again. Anything you
+decide (`memory enable`, `disable`, `CLOAK_MEMORY=...`, the permission prompt) replaces the default and is never
+overridden. Notes (`memory_remember`) and recipes stay **opt-in** because they hold free text.
+
+### What it learns, and how it uses it
+
+The loop is **observe, distill, apply, verify, prune**, all deterministic and local (no model call):
+
+| Learns (category) | Applied by | How it stays honest |
+|---|---|---|
+| Which load strategy works per site (`site_stats`): `domcontentloaded+500ms`, `load+1500ms`, `networkidle+2500ms`, `networkidle+4000ms` | `navigate` / `read_url` pick the best-scoring strategy when you do not set `wait_until` / `settle_ms`. A note says so when it differs from the default | each strategy scores `(ok+1)/(runs+2)` minus a small cost per step; two failures in a row bench it for 7 days; one failure is forgiven; ~8% of the time the cheaper strategy is probed again |
+| Pop-up and cookie-banner dismissers (`overlays`): a plain-CSS selector learned when you or the assistant clicked a button like "Accept" or "Close" that sat in a banner and really made it disappear | after each load, remembered dismissers that are visible are clicked | only selectors that passed a strict grammar; a dismisser that stops working is benched; ones that worked on 3+ sites become shared candidates for new sites (needs effort medium) |
+| Extractor recipes (`extractors`): the `item_selector` + `fields` of an `extract_structured` call that returned data | `read_url` runs a reliable recipe and returns the items first, with the page text cut to 1,500 characters (`use_memory=false` for the full page) | a recipe needs 2 successes at a smoothed 60%+ rate; empty results are marked down and two in a row bench it |
+| URL patterns and page types (`site_structure`), recorded visits | the `MEMORY[...]` note on `navigate`, `memory_recall` | numbers and our own labels only |
+
+Evidence **decays** (half-life 30 days) so a site that changed is re-learned, and `memory reflect` (also run
+automatically every 25 recorded navigations unless effort is `off`) forgets faded evidence, un-benches expired
+strategies and shares dismissers across sites. `cloakbrowser-mcp stats` and `memory_status` show what was learned and
+how often applying it worked, with an estimated token saving.
+
+**Safety by construction.** Learned selectors and recipes are only ever handed to the browser; they are never shown to
+the model (not in hints, `memory_status`, `memory_recall` or the audit log), so a page cannot use memory to talk to the
+assistant. Memory only changes *how* the browser loads or reads (timing, which known selector to click or read); it
+cannot touch domain policy, the private-IP block, `evaluate`, or its own consent. Set `CLOAK_MEMORY_APPLY=0` to make it
+observe only (it keeps learning but changes nothing).
+
+### What you control
 
 **What you choose** (each category separately):
 
 | Category | Stores | Never stores |
 |---|---|---|
-| `site_stats` | per-site success/block counts, status codes, load times, which browser settings worked, crawl-delay | page content, cookies, form values |
+| `site_stats` | per-site success/block counts, status codes, load times, which load strategy and browser settings worked, crawl-delay | page content, cookies, form values |
 | `site_structure` | URL patterns like `/c/{id}/{slug}` and page types | query values, real IDs, page text |
-| `extractors`, `overlays`, `recipes` | selectors, banner selectors, step templates (arrive in later releases) | extracted data, typed values |
+| `extractors` | the CSS selectors of extraction recipes that worked | the extracted data itself |
+| `overlays` | CSS selectors of pop-up dismiss buttons that worked | anything else on the page |
+| `recipes` | step templates (not implemented yet) | typed values |
 | `notes` | short lessons the assistant writes with `memory_remember` (scrubbed, max 400 chars) | page text, URLs, secrets |
 
-Presets: **minimal** (`site_stats`), **standard** (stats, structure, extractors, overlays), **full**, or custom.
-You also choose which sites (all, only a list, or all except a list), how long to keep data (30, 90, 365 days or
-forever), and a reflection effort (off, low, medium, high) for later phases. Banking, email, health, government,
-login and adult sites are never remembered, and login, checkout, cart and account pages are skipped everywhere.
+Presets: **minimal** (`site_stats`), **standard** (stats, structure, extractors, overlays; the default), **full**, or
+custom. You also choose which sites (all, only a list, or all except a list), how long to keep data (30, 90, 365 days
+or forever), and the effort (off, low, medium, high): `off` stops automatic reflection, `medium`/`high` add sharing
+dismissers across sites and explore more. Banking, email, health, government, login and adult sites are never
+remembered, and login, checkout, cart and account pages are skipped everywhere.
 
-**What it does today.** `navigate` adds a short note such as
-`MEMORY[site_stats]: 3 visits, 2 blocked; WARNING: this setup (headless=1,...) was blocked 2x here; worked before:
-headless=0,...`, so a blocked site is handled differently next time. `memory_recall` shows what is known about a
-site, and `memory_remember` saves a lesson. Saved lessons that look like instructions or contain URLs are set aside
-for you to review, never recalled, and recalled text is always wrapped as untrusted data.
+**Asking for more.** The assistant can call `memory_request_access`. Your client then shows its own form (MCP
+elicitation), which the model cannot fill in for you. If your client cannot show forms (Codex, for example), run
+`cloakbrowser-mcp memory enable --preset full` in a terminal instead. Declining, timing out or any error changes nothing.
+
+**Tools.** While memory runs on its defaults only `memory_request_access`, `memory_status` and `memory_recall` are listed
+(to keep tool definitions small); the rest (`memory_remember`, `memory_forget`, `memory_audit`, `memory_export`,
+`memory_disable`, `memory_incognito`) appear once you choose memory explicitly. Saved lessons that look like
+instructions or contain URLs are set aside for you to review, and recalled text is always wrapped as untrusted data.
 
 **Your controls.**
 - The assistant can only ask, narrow or read. It can never turn memory on or widen it.
-- `cloakbrowser-mcp memory setup | status | disable [category] | forget <site> | export | audit | wipe | reset`
+- `cloakbrowser-mcp memory setup | enable | status | reflect | disable [category] | forget <site> | export | audit | wipe | reset`
 - `memory_incognito`: stop reading and writing for the session (only you can end it).
-- New categories added by a future version are off until you are asked again.
-- Everything lives in `~/.cloakbrowser-mcp/memory/` (`consent.json`, `memory.db`) and is readable with `export`.
+- Everything lives in `~/.cloakbrowser-mcp/memory/` (`consent.json`, `memory.db`, `notice.json`) and is readable with `export`.
+  Databases from 0.3/0.4 are upgraded in place; nothing is lost.
 - Environment (set in the registration, overrides the file): `CLOAK_MEMORY=off|minimal|standard|full|custom`
   (`off` is a kill switch), `CLOAK_MEMORY_CATEGORIES`, `CLOAK_MEMORY_DOMAINS` / `CLOAK_MEMORY_BLOCKED`,
-  `CLOAK_MEMORY_RETENTION`, `CLOAK_MEMORY_EFFORT`, `CLOAK_MEMORY_INCOGNITO=1`, `CLOAK_MEMORY_NEVER_ASK=1`.
+  `CLOAK_MEMORY_RETENTION`, `CLOAK_MEMORY_EFFORT`, `CLOAK_MEMORY_INCOGNITO=1`, `CLOAK_MEMORY_NEVER_ASK=1`,
+  `CLOAK_MEMORY_DEFAULT=off` (no default-on), `CLOAK_MEMORY_APPLY=0` (observe only), `CLOAK_MEMORY_ALLOW_IP=1` (also
+  remember localhost / IP sites, for testing).
 
 ## Safety defaults
 
@@ -183,6 +221,7 @@ Defaults come from environment variables and can be changed at runtime with `con
 | `CLOAK_TOOLS` | `full` | tool profile: `lean` (18 tools), `standard`, `full`; `CLOAK_EXTRA_TOOLS=a,b` adds tools to `lean` |
 | `CLOAK_TOOLSETS` | all | comma list of `core,extract,debug,session,memory` (overrides the profile's groups) |
 | `CLOAK_SHOT_FORMAT`, `CLOAK_SHOT_QUALITY` | `jpeg`, `55` | default screenshot format and JPEG quality |
+| `CLOAK_MEMORY_DEFAULT`, `CLOAK_MEMORY_APPLY`, `CLOAK_MEMORY_ALLOW_IP` | on, `1`, off | default-on memory, apply what it learned, remember local sites (see Memory) |
 | `CLOAK_USAGE_LOG` | `1` | write tool name + result size per call for `cloakbrowser-mcp stats` |
 | `CLOAK_READONLY`, `CLOAK_ALLOW_EVAL`, `CLOAK_ALLOW_PRIVATE`, `CLOAK_ALLOWED_DOMAINS`, `CLOAK_BLOCKED_DOMAINS`, `CLOAK_WRAP_UNTRUSTED` | | see Safety defaults |
 | `CLOAK_MCP_HOME` | `~/.cloakbrowser-mcp` | profiles, sessions, output files, logs |
@@ -205,6 +244,7 @@ python -m venv .venv && .venv/bin/pip install -e ".[dev]"     # Windows: .venv\S
 pytest -q                 # 220+ tests against a local static site and the MCP protocol
 python e2e.py             # stdio MCP client against live Skroutz (needs network)
 python e2e_memory.py      # consent prompt + memory over real MCP stdio, in a temp home
+python e2e_learning.py    # default-on memory: notice, learned pop-ups / load strategy / extractors, persistence, disable
 python e2e_savings.py     # lean profile, read_url/run_steps, scaled screenshots, usage log, opt-in memory tools
 python bench_tokens.py URL...   # before/after token estimates on real pages
 ```

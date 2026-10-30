@@ -90,7 +90,41 @@ async def _definition_sizes() -> list[tuple[str, int, int]]:
     return rows
 
 
-def render(summary: dict, days: float | None, defs=None, top: int = 12) -> str:
+def memory_report() -> dict | None:
+    """What site memory has learned and how often applying it worked (numbers only), or None if unavailable."""
+    try:
+        from .memory import Memory, default_on_from_env
+
+        return Memory(default_on=default_on_from_env()).status()
+    except Exception:
+        return None
+
+
+def render_memory(st: dict | None) -> list[str]:
+    if not st:
+        return []
+    if not st.get("enabled"):
+        return ["", "Site memory: off (run `cloakbrowser-mcp memory enable` to turn it on)"]
+    learned = st.get("learned") or {}
+    lines = ["", f"Site memory: on ({st['source']}, {st['preset']}){'' if st.get('auto_apply', True) else ', observe-only'}"]
+    if not learned:
+        return lines + ["  nothing learned yet; it learns as pages are visited"]
+    lines.append(
+        f"  learned: {learned.get('sites_with_playbook', 0)} site load playbooks ({learned.get('benched_strategies', 0)} strategies benched), "
+        f"{learned.get('popup_dismissers', 0)} pop-up dismissers (+{learned.get('shared_dismissers', 0)} shared), "
+        f"{learned.get('extractors', 0)} extractor recipes"
+    )
+    imp = learned.get("impact") or {}
+    if imp:
+        for kind, d in sorted(imp.items()):
+            lines.append(f"  applied {kind}: {d['applied']}x, {d['ok']} worked, ~{d['est_tokens_saved']:,} tokens saved (estimate)")
+        lines.append(f"  total estimated saving from memory: ~{sum(d['est_tokens_saved'] for d in imp.values()):,} tokens")
+    else:
+        lines.append("  nothing applied yet (learned settings are used from the second visit to a site)")
+    return lines
+
+
+def render(summary: dict, days: float | None, defs=None, top: int = 12, memory=None) -> str:
     lines = []
     span = f"last {days:g} days" if days else "all recorded calls"
     t = summary["total"]
@@ -110,6 +144,7 @@ def render(summary: dict, days: float | None, defs=None, top: int = 12) -> str:
         lines.append("Tool definitions, re-sent on EVERY turn (set CLOAK_TOOLS to pick one):")
         for label, n, tokens in defs:
             lines.append(f"  {label:<20}{n:>3} tools  ~{tokens:,} tokens")
+    lines += render_memory(memory)
     return "\n".join(lines)
 
 
@@ -118,6 +153,7 @@ def main(argv: list[str]) -> int:
     ap.add_argument("--days", type=float, default=None, help="only the last N days")
     ap.add_argument("--json", action="store_true", help="machine-readable output")
     ap.add_argument("--no-defs", action="store_true", help="skip the tool-definition sizes (faster)")
+    ap.add_argument("--no-memory", action="store_true", help="skip the site-memory section")
     ap.add_argument("--reset", action="store_true", help="delete the usage log")
     ns = ap.parse_args(argv)
     if ns.reset:
@@ -127,8 +163,12 @@ def main(argv: list[str]) -> int:
         return 0
     summary = summarize(load(ns.days))
     defs = None if ns.no_defs else asyncio.run(_definition_sizes())
+    mem = None if ns.no_memory else memory_report()
     if ns.json:
-        print(json.dumps({"results": summary, "definitions": [dict(profile=l, tools=n, tokens=t) for l, n, t in defs or []]}, indent=2))
+        out = {"results": summary, "definitions": [dict(profile=l, tools=n, tokens=t) for l, n, t in defs or []]}
+        if mem is not None:
+            out["memory"] = {"enabled": mem["enabled"], "source": mem["source"], "auto_apply": mem["auto_apply"], "learned": mem["learned"]}
+        print(json.dumps(out, indent=2))
     else:
-        print(render(summary, ns.days, defs))
+        print(render(summary, ns.days, defs, memory=mem))
     return 0

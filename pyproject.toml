@@ -27,4 +27,4 @@ cloakbrowser-mcp = "cloakbrowser_mcp.cli:main"
 path = "cloakbrowser_mcp/__init__.py"
 
 [tool.hatch.build.targets.sdist]
-include = ["cloakbrowser_mcp", "tests", "README.md", "LICENSE", "e2e.py", "e2e_savings.py", "bench_tokens.py", "pytest.ini"]
+include = ["cloakbrowser_mcp", "tests", "README.md", "LICENSE", "e2e.py", "e2e_savings.py", "e2e_learning.py", "bench_tokens.py", "pytest.ini"]

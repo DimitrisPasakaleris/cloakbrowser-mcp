@@ -16,6 +16,7 @@ import dataclasses
 import json
 import logging
 import os
+import random
 import re
 import sqlite3
 import sys
@@ -27,9 +28,11 @@ from typing import Callable
 
 from pydantic import BaseModel, Field, field_validator
 
+from . import learn
+
 _log = logging.getLogger("cloakbrowser-mcp")
 CONSENT_VERSION = 1
-SCHEMA_VERSION = 1
+SCHEMA_VERSION = 2
 DEFAULT_RETENTION = 90
 
 CATEGORIES = ("site_stats", "site_structure", "extractors", "overlays", "recipes", "notes")
@@ -63,7 +66,7 @@ ASK_MODES = ("ask", "later", "never")
 
 # Category -> tables holding its data (some arrive in later phases).
 CATEGORY_TABLES = {
-    "site_stats": ("sites", "config_stats", "events"),
+    "site_stats": ("sites", "config_stats", "events", "playbook", "impact", "meta"),
     "site_structure": ("patterns",),
     "extractors": ("extractors",),
     "overlays": ("overlays",),
@@ -245,6 +248,24 @@ class Consent:
         return frozenset(c for c in self.categories if c in self.offered)
 
 
+# Used when the user has made no choice at all (no consent file, no CLOAK_MEMORY) and default-on is allowed. It is a
+# virtual consent: nothing is written to consent.json, so the first explicit choice (or `memory disable`) replaces it.
+DEFAULT_CONSENT = Consent(
+    source="default",
+    preset="standard",
+    categories=frozenset(("site_stats", "site_structure", "extractors", "overlays")),
+    effort="medium",
+    reflect_when="triggers",
+    ask="never",
+)
+NOTICE = (
+    "MEMORY IS ON by default (standard: per-site load stats, URL patterns, and pop-up / extractor selectors; no page "
+    "text, cookies or form values; local only; banking, email, health and government sites excluded). It learns which "
+    "load settings, pop-up dismissers and extractors work per site and reuses them. Turn it off: set CLOAK_MEMORY=off "
+    "in the MCP registration, or run `cloakbrowser-mcp memory disable`."
+)
+
+
 def _preset_name(cats) -> str:
     cats = tuple(c for c in CATEGORIES if c in cats)
     for name, members in PRESETS.items():
@@ -331,6 +352,11 @@ def _from_env(env) -> Consent | None:
     )
 
 
+def default_on_from_env(env=None) -> bool:
+    """Is the default-on preset allowed? CLOAK_MEMORY_DEFAULT=off restores the old opt-in behaviour."""
+    return str((os.environ if env is None else env).get("CLOAK_MEMORY_DEFAULT") or "on").strip().lower() not in ("0", "off", "false", "no")
+
+
 def _truthy(v) -> bool:
     return str(v or "").strip().lower() in ("1", "true", "yes", "on")
 
@@ -364,6 +390,28 @@ CREATE TABLE audit(
 CREATE INDEX events_ts ON events(ts);
 CREATE INDEX notes_site ON notes(site);
 """
+# Schema 2 (self-improving memory). Counts are REAL because old evidence decays (learn.HALF_LIFE_DAYS). Everything stored
+# here is a number, our own label, or a selector that passed learn.safe_selector; never page text.
+_SCHEMA_V2 = """
+CREATE TABLE IF NOT EXISTS playbook(
+  site TEXT, arm INTEGER, runs REAL DEFAULT 0, ok REAL DEFAULT 0, streak_fail INTEGER DEFAULT 0,
+  demoted_until REAL DEFAULT 0, last_seen REAL, PRIMARY KEY(site, arm)
+);
+CREATE TABLE IF NOT EXISTS overlays(
+  site TEXT, selector TEXT, hits REAL DEFAULT 0, misses REAL DEFAULT 0, streak_miss INTEGER DEFAULT 0,
+  state TEXT DEFAULT 'active', last_seen REAL, PRIMARY KEY(site, selector)
+);
+CREATE TABLE IF NOT EXISTS extractors(
+  site TEXT, page_type TEXT, spec TEXT, kind TEXT DEFAULT 'structured', runs REAL DEFAULT 0, ok REAL DEFAULT 0,
+  streak_fail INTEGER DEFAULT 0, state TEXT DEFAULT 'active', items INTEGER DEFAULT 0, last_seen REAL,
+  PRIMARY KEY(site, page_type, spec)
+);
+CREATE TABLE IF NOT EXISTS impact(
+  kind TEXT PRIMARY KEY, applied INTEGER DEFAULT 0, ok INTEGER DEFAULT 0, saved_tokens INTEGER DEFAULT 0, last_seen REAL
+);
+CREATE TABLE IF NOT EXISTS meta(key TEXT PRIMARY KEY, value TEXT);
+"""
+NON_SITE_TABLES = {"impact", "meta"}  # no per-site rows: skipped when forgetting a site
 MAX_EVENTS = 20000
 MAX_AUDIT = 5000
 
@@ -383,8 +431,12 @@ class Store:
             c.row_factory = sqlite3.Row
             c.execute("PRAGMA journal_mode=WAL")
             c.execute("PRAGMA busy_timeout=5000")
-            if c.execute("PRAGMA user_version").fetchone()[0] == 0:
+            ver = c.execute("PRAGMA user_version").fetchone()[0]
+            if ver == 0:
                 c.executescript(_SCHEMA)
+            if ver < 2:  # new databases and v1 databases (kept as they are) both gain the learning tables
+                c.executescript(_SCHEMA_V2)
+            if ver < SCHEMA_VERSION:
                 c.execute(f"PRAGMA user_version={SCHEMA_VERSION}")
             self._conn = c
         return self._conn
@@ -452,7 +504,7 @@ class Store:
         have, n = self.tables(), 0
         for tables in CATEGORY_TABLES.values():
             for t in tables:
-                if t in have:
+                if t in have and t not in NON_SITE_TABLES:
                     n += self.conn().execute(f"DELETE FROM {t} WHERE site=?", (site,)).rowcount
         return n
 
@@ -462,7 +514,8 @@ class Store:
         cutoff = now - days * 86400
         c, have = self.conn(), self.tables()
         for t, col in (("events", "ts"), ("notes", "ts"), ("patterns", "last_seen"), ("config_stats", "last_seen"),
-                       ("sites", "last_seen"), ("audit", "ts")):
+                       ("sites", "last_seen"), ("audit", "ts"), ("playbook", "last_seen"), ("overlays", "last_seen"),
+                       ("extractors", "last_seen")):
             if t in have:
                 c.execute(f"DELETE FROM {t} WHERE {col} < ?", (cutoff,))
         c.execute("DELETE FROM events WHERE id <= (SELECT COALESCE(MAX(id), 0) FROM events) - ?", (MAX_EVENTS,))
@@ -514,17 +567,32 @@ def _host_of(site_or_url: str) -> str:
 
 # ---------------------------------------------------------------- the facade
 class Memory:
-    def __init__(self, base: Path | None = None, env=None, allow_ip: bool = False, clock: Callable[[], float] = time.time):
+    def __init__(
+        self,
+        base: Path | None = None,
+        env=None,
+        allow_ip: bool = False,
+        clock: Callable[[], float] = time.time,
+        default_on: bool = False,
+        rng: random.Random | None = None,
+    ):
         self.base = Path(base) if base else default_base()
         self.env = os.environ if env is None else env
         self.allow_ip = allow_ip
         self.clock = clock
+        self.default_on = default_on  # the standard preset applies until the user decides otherwise
+        self.rng = rng or random.Random()
         self.incognito = _truthy(self.env.get("CLOAK_MEMORY_INCOGNITO"))
         self.prompts = 0  # permission requests made this session
         self.hinted = False  # "memory is off" hint shown this session
         self._store: Store | None = None
         self._cc: tuple | None = None
         self._purged = False
+
+    @property
+    def apply_on(self) -> bool:
+        """Learned settings are applied automatically unless CLOAK_MEMORY_APPLY=0 (then memory only observes)."""
+        return (self.env.get("CLOAK_MEMORY_APPLY") or "1").strip().lower() not in ("0", "false", "off", "no")
 
     # -- paths
     @property
@@ -544,7 +612,7 @@ class Memory:
             mtime = self.consent_path.stat().st_mtime_ns
         except OSError:
             self._cc = None
-            return Consent()
+            return DEFAULT_CONSENT if self.default_on else Consent()
         if self._cc and self._cc[0] == mtime:
             c = self._cc[1]
         else:
@@ -586,13 +654,28 @@ class Memory:
         if _truthy(self.env.get("CLOAK_MEMORY_NEVER_ASK")):
             return False
         c = self.consent()
-        if c.source == "env":
+        if c.source in ("env", "default"):
             return False
         if c.source == "none":
             return True
         if c.needs_reconsent and c.ask != "never":
             return True
         return c.ask == "later" and self.clock() >= c.ask_after and not c.enabled
+
+    @property
+    def notice_path(self) -> Path:
+        return self.base / "notice.json"
+
+    def notice(self) -> str:
+        """The default-on disclosure, returned once ever (then remembered in notice.json); '' otherwise."""
+        if self.consent().source != "default" or self.incognito or self.notice_path.exists():
+            return ""
+        try:
+            self.base.mkdir(parents=True, exist_ok=True)
+            self.notice_path.write_text(json.dumps({"shown_at": self.clock()}), encoding="utf-8")
+        except OSError:
+            return ""
+        return NOTICE
 
     # -- store (created lazily and only after consent)
     def store(self) -> Store:
@@ -704,20 +787,23 @@ class Memory:
 
     def reset_consent(self) -> None:
         self.wipe()
-        try:
-            self.consent_path.unlink()
-        except FileNotFoundError:
-            pass
+        for p in (self.consent_path, self.notice_path):
+            try:
+                p.unlink()
+            except FileNotFoundError:
+                pass
         self._cc = None
 
     # -- passive learning (Phase 1): every method is gated and silent when memory is off
-    def record_navigation(self, url, status, blocked, ms, config="", failed=False) -> bool:
+    def record_navigation(self, url, status, blocked, ms, config="", failed=False, arm=None) -> bool:
         rec = recordable_url(url, self.allow_ip)
         if not rec:
             return False
         host, site, pattern, ptype = rec
         wrote = False
         now = self.clock()
+        if arm is not None and self.allow("site_stats", host):
+            self._record_arm(site, arm, bool(not failed and not blocked and status is not None and status < 400), now)
         if self.allow("site_stats", host):
             ok = int(not failed and not blocked and status is not None and status < 400)
             blk, fail = int(bool(blocked)), int(bool(failed))
@@ -755,7 +841,245 @@ class Memory:
             )
             st.audit_add(now, "site_structure", "pattern", site, f"{pattern} ({ptype})")
             wrote = True
+        if wrote:
+            self._maybe_reflect()
         return wrote
+
+    # -- Phase 2: the per-site load playbook (category: site_stats)
+    def _arm_stats(self, site: str, now: float) -> dict:
+        out = {}
+        for r in self.store().conn().execute("SELECT * FROM playbook WHERE site=?", (site,)):
+            out[r["arm"]] = learn.ArmStat(
+                runs=learn.decay(r["runs"], r["last_seen"], now),
+                ok=learn.decay(r["ok"], r["last_seen"], now),
+                demoted_until=r["demoted_until"] or 0.0,
+                last_seen=r["last_seen"] or 0.0,
+            )
+        return out
+
+    def plan_navigation(self, url) -> learn.Plan | None:
+        """Which load strategy to use for this site, from what has worked here before. None = memory has no say."""
+        if not self.apply_on:
+            return None
+        rec = recordable_url(url, self.allow_ip)
+        if not rec or not self.allow("site_stats", rec[0]):
+            return None
+        now = self.clock()
+        stats = self._arm_stats(rec[1], now) if self.db_path.exists() else {}
+        explore = learn.EXPLORE.get(self.consent().effort, learn.EXPLORE["medium"])
+        return learn.choose_arm(stats, now, self.rng, explore)
+
+    def _record_arm(self, site: str, arm: int, ok: bool, now: float) -> None:
+        c = self.store().conn()
+        row = c.execute("SELECT * FROM playbook WHERE site=? AND arm=?", (site, arm)).fetchone()
+        runs = learn.decay(row["runs"], row["last_seen"], now) if row else 0.0
+        oks = learn.decay(row["ok"], row["last_seen"], now) if row else 0.0
+        streak, until = learn.next_streak(row["streak_fail"] if row else 0, ok, now)
+        c.execute(
+            "INSERT INTO playbook(site, arm, runs, ok, streak_fail, demoted_until, last_seen) VALUES(?,?,?,?,?,?,?)"
+            " ON CONFLICT(site, arm) DO UPDATE SET runs=excluded.runs, ok=excluded.ok, streak_fail=excluded.streak_fail,"
+            " demoted_until=excluded.demoted_until, last_seen=excluded.last_seen",
+            (site, arm, runs + 1, oks + (1 if ok else 0), streak, until, now),
+        )
+        if until and not (row and row["demoted_until"] and row["demoted_until"] > now):
+            self.store().audit_add(now, "site_stats", "benched", site, f"{learn.ARMS[arm].label} failed {streak}x; skipped for {learn.COOLDOWN_DAYS:g} days")
+
+    def note_impact(self, kind: str, ok: bool, saved_tokens: int = 0) -> None:
+        """Count one automatic application of something learned (for `stats` / memory_status)."""
+        if not self.db_path.exists() and not self.any_enabled():
+            return
+        c = self.store().conn()
+        c.execute(
+            "INSERT INTO impact(kind, applied, ok, saved_tokens, last_seen) VALUES(?,1,?,?,?)"
+            " ON CONFLICT(kind) DO UPDATE SET applied=applied+1, ok=ok+excluded.ok, saved_tokens=saved_tokens+excluded.saved_tokens,"
+            " last_seen=excluded.last_seen",
+            (kind, int(bool(ok)), int(saved_tokens) if ok else 0, self.clock()),
+        )
+
+    # -- Phase 3: pop-up dismissers (category: overlays)
+    def wants_overlay(self, url) -> bool:
+        rec = recordable_url(url, self.allow_ip)
+        return bool(rec and self.allow("overlays", rec[0]))
+
+    def overlay_candidates(self, url, limit: int = 4) -> list[str]:
+        """Selectors to try on this page: ones that dismissed a pop-up here before, then ones that worked on 3+ sites."""
+        if not self.apply_on or not self.db_path.exists():
+            return []
+        rec = recordable_url(url, self.allow_ip)
+        if not rec or not self.allow("overlays", rec[0]):
+            return []
+        rows = self.store().conn().execute(
+            "SELECT selector, site FROM overlays WHERE site IN (?, '*') AND state IN ('active', 'candidate')"
+            " ORDER BY (site='*'), hits DESC, last_seen DESC LIMIT ?",
+            (rec[1], limit),
+        ).fetchall()
+        return [r["selector"] for r in rows]
+
+    def record_overlay(self, url, selector, ok: bool, applied: bool = False) -> bool:
+        """A pop-up dismisser worked (ok) or did not. applied=True means we clicked it ourselves from memory."""
+        rec = recordable_url(url, self.allow_ip)
+        sel = learn.safe_selector(selector)
+        if not rec or sel is None or not self.allow("overlays", rec[0]):
+            return False
+        site, now = rec[1], self.clock()
+        c = self.store().conn()
+        row = c.execute("SELECT * FROM overlays WHERE site=? AND selector=?", (site, sel)).fetchone()
+        shared = c.execute("SELECT * FROM overlays WHERE site='*' AND selector=?", (sel,)).fetchone()
+        if row is None and not ok:
+            if applied and shared is not None:  # a shared dismisser clicked here without effect: count it against the shared entry
+                streak = shared["streak_miss"] + 1
+                c.execute(
+                    "UPDATE overlays SET misses=misses+1, streak_miss=?, state=?, last_seen=? WHERE site='*' AND selector=?",
+                    (streak, "demoted" if streak >= learn.DEMOTE_AFTER + 1 else shared["state"], now, sel),
+                )
+                self.note_impact("overlay", False)
+                return True
+            return False  # never learn from a failure we did not already believe in
+        hits = learn.decay(row["hits"], row["last_seen"], now) if row else 0.0
+        misses = learn.decay(row["misses"], row["last_seen"], now) if row else 0.0
+        streak = 0 if ok else row["streak_miss"] + 1
+        state = "active" if ok else ("demoted" if streak >= learn.DEMOTE_AFTER + 1 else row["state"])
+        c.execute(
+            "INSERT INTO overlays(site, selector, hits, misses, streak_miss, state, last_seen) VALUES(?,?,?,?,?,?,?)"
+            " ON CONFLICT(site, selector) DO UPDATE SET hits=excluded.hits, misses=excluded.misses,"
+            " streak_miss=excluded.streak_miss, state=excluded.state, last_seen=excluded.last_seen",
+            (site, sel, hits + (1 if ok else 0), misses + (0 if ok else 1), streak, state, now),
+        )
+        if shared is not None and ok and applied:  # a shared candidate just proved itself on a new site: confirm it
+            c.execute("UPDATE overlays SET state='active', hits=hits+1, streak_miss=0, last_seen=? WHERE site='*' AND selector=?", (now, sel))
+        self.store().audit_add(now, "overlays", "applied" if applied else "learned", site, f"{'ok' if ok else 'missed'} ({state})")
+        if applied:
+            self.note_impact("overlay", ok, 250)  # roughly one saved snapshot + click round trip
+        return True
+
+    # -- Phase 3: extractors that worked (category: extractors)
+    def record_extractor(self, url, item_selector, fields, ok: bool, items: int = 0, applied: bool = False) -> bool:
+        rec = recordable_url(url, self.allow_ip)
+        spec = learn.canonical_extractor(item_selector, fields)
+        if not rec or spec is None or not self.allow("extractors", rec[0]):
+            return False
+        host, site, _pattern, ptype = rec
+        now = self.clock()
+        c = self.store().conn()
+        row = c.execute("SELECT * FROM extractors WHERE site=? AND page_type=? AND spec=?", (site, ptype, spec)).fetchone()
+        if row is None and not ok:
+            return False  # a recipe that never worked (a guess, a typo) is not worth remembering
+        runs = learn.decay(row["runs"], row["last_seen"], now) if row else 0.0
+        oks = learn.decay(row["ok"], row["last_seen"], now) if row else 0.0
+        streak = 0 if ok else (row["streak_fail"] + 1 if row else 1)
+        state = "active" if ok else ("demoted" if streak >= learn.DEMOTE_AFTER else (row["state"] if row else "active"))
+        c.execute(
+            "INSERT INTO extractors(site, page_type, spec, kind, runs, ok, streak_fail, state, items, last_seen)"
+            " VALUES(?,?,?,'structured',?,?,?,?,?,?) ON CONFLICT(site, page_type, spec) DO UPDATE SET runs=excluded.runs,"
+            " ok=excluded.ok, streak_fail=excluded.streak_fail, state=excluded.state, items=excluded.items,"
+            " last_seen=excluded.last_seen",
+            (site, ptype, spec, runs + 1, oks + (1 if ok else 0), streak, state, int(items), now),
+        )
+        self.store().audit_add(now, "extractors", "applied" if applied else "learned", site, f"{ptype} {'ok' if ok else 'empty'} ({state}, {items} items)")
+        if applied:
+            self.note_impact("extractor", ok, 900)  # roughly the page text the model no longer has to read
+        return True
+
+    def best_extractor(self, url) -> dict | None:
+        """The recipe that has worked most reliably for this kind of page on this site, or None."""
+        if not self.apply_on or not self.db_path.exists():
+            return None
+        rec = recordable_url(url, self.allow_ip)
+        if not rec or not self.allow("extractors", rec[0]):
+            return None
+        now = self.clock()
+        best = None
+        for r in self.store().conn().execute(
+            "SELECT * FROM extractors WHERE site=? AND page_type=? AND state='active'", (rec[1], rec[3])
+        ):
+            runs, oks = learn.decay(r["runs"], r["last_seen"], now), learn.decay(r["ok"], r["last_seen"], now)
+            if learn.reliable(oks, runs) and (best is None or oks > best[0]):
+                best = (oks, r["spec"])
+        if best is None:
+            return None
+        try:
+            d = json.loads(best[1])
+            return {"item_selector": d["item"], "fields": d["fields"]}
+        except (ValueError, KeyError, TypeError):
+            return None
+
+    # -- Phase 4: reflection (verify, prune, generalise)
+    REFLECT_EVERY = 25  # recorded navigations between automatic passes
+
+    def _meta_get(self, key, default=0):
+        r = self.store().conn().execute("SELECT value FROM meta WHERE key=?", (key,)).fetchone()
+        return type(default)(r["value"]) if r else default
+
+    def _meta_set(self, key, value):
+        self.store().conn().execute(
+            "INSERT INTO meta(key, value) VALUES(?,?) ON CONFLICT(key) DO UPDATE SET value=excluded.value", (key, str(value))
+        )
+
+    def _maybe_reflect(self) -> None:
+        if self.consent().effort == "off":
+            return
+        n = self._meta_get("since_reflect", 0) + 1
+        if n >= self.REFLECT_EVERY:
+            self.reflect()
+        else:
+            self._meta_set("since_reflect", n)
+
+    def reflect(self) -> dict:
+        """One learning pass: forget what has faded, let benched strategies go, and share what worked across sites.
+        Deterministic and local: no model call. Safe to run any time (`cloakbrowser-mcp memory reflect`)."""
+        if not self.any_enabled():
+            return {"memory": "off"}
+        now, effort = self.clock(), self.consent().effort
+        c = self.store().conn()
+        out = {"forgot": 0, "unbenched": 0, "promoted": 0}
+        for table, col in (("playbook", "runs"), ("extractors", "runs")):
+            for r in c.execute(f"SELECT rowid AS rid, {col} AS v, last_seen FROM {table}").fetchall():
+                if learn.decay(r["v"], r["last_seen"], now) < learn.MIN_EVIDENCE:
+                    c.execute(f"DELETE FROM {table} WHERE rowid=?", (r["rid"],))
+                    out["forgot"] += 1
+        for r in c.execute("SELECT rowid AS rid, hits, last_seen FROM overlays").fetchall():
+            if learn.decay(r["hits"], r["last_seen"], now) < learn.MIN_EVIDENCE:
+                c.execute("DELETE FROM overlays WHERE rowid=?", (r["rid"],))
+                out["forgot"] += 1
+        out["unbenched"] = c.execute(
+            "UPDATE playbook SET demoted_until=0, streak_fail=0 WHERE demoted_until>0 AND demoted_until<=?", (now,)
+        ).rowcount
+        out["unbenched"] += c.execute(
+            "DELETE FROM overlays WHERE state='demoted' AND last_seen<?", (now - 30 * 86400,)
+        ).rowcount
+        if effort in ("medium", "high") and self.consent().enabled >= {"overlays"}:
+            for r in c.execute(
+                "SELECT selector FROM overlays WHERE site<>'*' AND state='active' AND hits>=?"
+                " GROUP BY selector HAVING COUNT(DISTINCT site)>=3",
+                (learn.MIN_OK,),
+            ).fetchall():
+                if c.execute("SELECT 1 FROM overlays WHERE site='*' AND selector=?", (r["selector"],)).fetchone() is None:
+                    c.execute(
+                        "INSERT INTO overlays(site, selector, hits, misses, streak_miss, state, last_seen) VALUES('*',?,1,0,0,'candidate',?)",  # 1 unit of evidence: survives until tried, fades if never confirmed
+                        (r["selector"], now),
+                    )
+                    out["promoted"] += 1
+        self._meta_set("since_reflect", 0)
+        self._meta_set("last_reflect", now)
+        self.store().audit_add(now, "reflect", "pass", "", f"forgot {out['forgot']}, unbenched {out['unbenched']}, shared {out['promoted']}")
+        return out
+
+    def learned(self) -> dict:
+        """What has been learned so far, as plain numbers (no selectors, no page content)."""
+        if not self.db_path.exists():
+            return {}
+        c = self.store().conn()
+        q = lambda sql: c.execute(sql).fetchone()[0]
+        out = {
+            "sites_with_playbook": q("SELECT COUNT(DISTINCT site) FROM playbook"),
+            "benched_strategies": q(f"SELECT COUNT(*) FROM playbook WHERE demoted_until>{self.clock()}"),
+            "popup_dismissers": q("SELECT COUNT(*) FROM overlays WHERE site<>'*' AND state='active'"),
+            "shared_dismissers": q("SELECT COUNT(*) FROM overlays WHERE site='*' AND state IN ('active','candidate')"),
+            "extractors": q("SELECT COUNT(*) FROM extractors WHERE state='active'"),
+        }
+        out["impact"] = {r["kind"]: {"applied": r["applied"], "ok": r["ok"], "est_tokens_saved": r["saved_tokens"]}
+                         for r in c.execute("SELECT * FROM impact")}
+        return out
 
     def _site_row(self, site: str):
         return self.store().conn().execute("SELECT * FROM sites WHERE site=?", (site,)).fetchone()
@@ -909,14 +1233,17 @@ class Memory:
     def status(self) -> dict:
         c = self.consent()
         db = {"path": str(self.db_path), "exists": self.db_path.exists()}
-        counts = {}
+        counts, learned = {}, {}
         if db["exists"]:
             db["size_kb"] = round(self.db_path.stat().st_size / 1024, 1)
             counts = self.store().counts()
+            learned = self.learned()
         return {
             "enabled": bool(c.enabled) and not self.incognito,
             "incognito": self.incognito,
             "source": c.source,
+            "auto_apply": self.apply_on,
+            "learned": learned,
             "preset": c.preset if c.source != "none" else "off",
             "categories": {cat: cat in c.enabled for cat in CATEGORIES},
             "scope": {"mode": c.scope_mode, "domains": list(c.scope_domains)},
@@ -1094,12 +1421,13 @@ def _setup_args(p):
 
 
 def cli_main(argv: list[str], mem: Memory | None = None, out=print) -> int:
-    mem = mem or Memory()
+    mem = mem or Memory(default_on=default_on_from_env())
     ap = argparse.ArgumentParser(prog="cloakbrowser-mcp memory", description="Manage cloakbrowser-mcp site memory")
     sub = ap.add_subparsers(dest="cmd", required=True)
     _setup_args(sub.add_parser("setup", help="choose what may be remembered (interactive, or flags with --yes)"))
     _setup_args(sub.add_parser("enable", help="same as setup --yes"))
     sub.add_parser("status", help="show what is on and what is stored")
+    sub.add_parser("reflect", help="run one learning pass now (forget faded evidence, un-bench, share what worked across sites)")
     d = sub.add_parser("disable", help="turn a category (or all) off and delete its data")
     d.add_argument("category", nargs="?", default="all")
     f = sub.add_parser("forget", help="delete everything remembered about a site")
@@ -1142,6 +1470,8 @@ def cli_main(argv: list[str], mem: Memory | None = None, out=print) -> int:
                 out(f"Data deleted for categories turned off: {', '.join(dropped)}")
         elif ns.cmd == "status":
             out(json.dumps(mem.status(), indent=2))
+        elif ns.cmd == "reflect":
+            out(json.dumps(mem.reflect()))
         elif ns.cmd == "disable":
             out(mem.disable(ns.category))
         elif ns.cmd == "forget":

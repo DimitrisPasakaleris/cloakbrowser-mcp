@@ -16,6 +16,7 @@ os.environ["CLOAK_ALLOW_PRIVATE"] = "1"  # the test site is on loopback
 os.environ["CLOAK_MEMORY_NEVER_ASK"] = "1"  # keep the "memory is off" hint out of unrelated tests
 os.environ["CLOAK_MEMORY_TOOLS"] = "all"  # the tests exercise every memory tool, not just the opt-in gate
 os.environ["CLOAK_USAGE_LOG"] = "0"
+os.environ["CLOAK_MEMORY_DEFAULT"] = "off"  # most tests expect memory off; default-on is tested with its own Memory objects
 
 
 class Handler(http.server.SimpleHTTPRequestHandler):

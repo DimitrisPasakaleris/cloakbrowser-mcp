@@ -37,6 +37,7 @@ from mcp.server.fastmcp import Context, FastMCP, Image
 from mcp.types import ToolAnnotations
 from cloakbrowser import launch_context_async, launch_persistent_context_async
 
+from . import learn as learnlib
 from . import memory as memorylib
 
 HOME = Path(os.environ.get("CLOAK_MCP_HOME", Path.home() / ".cloakbrowser-mcp"))
@@ -124,7 +125,12 @@ class State:
 S = State()
 MAX_NET = 400
 DEFAULT_CHARS = 6000  # ~1.5k tokens per read; page with offset=, or search with find_in_page
-MEM = memorylib.Memory(HOME / "memory")
+LEARNED_TEXT_CHARS = 1500  # page text kept next to the items when a learned extractor recipe is used (see read_url)
+MEM = memorylib.Memory(
+    HOME / "memory",
+    default_on=memorylib.default_on_from_env(),
+    allow_ip=_env_bool("CLOAK_MEMORY_ALLOW_IP", False),  # remember localhost / IP sites too (for local testing)
+)
 
 
 def _mem(fn, *args, **kw):
@@ -392,14 +398,24 @@ def _profile() -> str:
     return p if p in ("lean", *PROFILE_TOOLSETS) else "full"
 
 
-def _memory_tools_open() -> bool:
-    """Memory tools beyond memory_request_access are only listed once the user has switched memory on."""
+MEMORY_LIGHT_TOOLS = {"memory_status", "memory_recall"}  # listed while memory runs on its defaults
+
+
+def _memory_level():
+    """How many memory tools to list: False (off: just memory_request_access), "light" (default-on: plus status and
+    recall, so the user can see what was learned) or True (the user chose memory explicitly: everything)."""
     if os.environ.get("CLOAK_MEMORY_TOOLS", "").lower() == "all":
         return True
     try:
-        return bool(MEM.status()["enabled"])
+        if not MEM.status()["enabled"]:
+            return False
+        return "light" if MEM.consent().source == "default" else True
     except Exception:
         return False
+
+
+def _memory_tools_open() -> bool:
+    return _memory_level() is True
 
 
 def tool_enabled(name: str, toolsets=None, readonly=None, profile=None, memory_on=None) -> bool:
@@ -416,10 +432,11 @@ def tool_enabled(name: str, toolsets=None, readonly=None, profile=None, memory_o
         raw = os.environ.get("CLOAK_TOOLSETS") or PROFILE_TOOLSETS[profile]
         toolsets = {t.strip() for t in raw.split(",") if t.strip()}
         if memory_on is None:
-            memory_on = _memory_tools_open()
+            memory_on = _memory_level()
     group = next((g for g, names in TOOLSET_MEMBERS.items() if name in names), "core")
-    if group == "memory" and name != "memory_request_access" and memory_on is False:
-        return False
+    if group == "memory" and name != "memory_request_access":
+        if memory_on is False or (memory_on == "light" and name not in MEMORY_LIGHT_TOOLS):
+            return False
     return group in toolsets
 
 
@@ -698,6 +715,34 @@ JS_EXTRACT = """([sel, fields, limit]) => [...document.querySelectorAll(sel)].sl
 
 JS_LINKS = """() => [...document.querySelectorAll('a[href]')].map(a => ({text: (a.innerText || a.getAttribute('aria-label') || '').trim().replace(/\\s+/g, ' ').slice(0, 120), href: a.href}))"""
 
+# Describes a clicked element for pop-up learning: its label, a stable plain-CSS selector (only if that selector matches
+# exactly one element) and whether it sits inside something that looks like a cookie banner, consent box or dialog.
+JS_CLICK_INFO = """(el) => {
+  const text = (el.innerText || el.value || el.getAttribute('aria-label') || '').trim().replace(/\\s+/g, ' ').slice(0, 60);
+  const ctx = el.closest('[id*="cookie" i],[class*="cookie" i],[id*="consent" i],[class*="consent" i],[class*="gdpr" i],[id*="onetrust" i],[id*="cmp" i],[role="dialog"],[aria-modal="true"],[class*="modal" i],[class*="popup" i],[class*="banner" i],[id*="banner" i],[class*="overlay" i]');
+  const stable = c => c.length <= 40 && !/\\d{3,}/.test(c) && !/^[a-z0-9]{12,}$/i.test(c);
+  const unique = q => { try { return document.querySelectorAll(q).length === 1; } catch (e) { return false; } };
+  const tag = el.tagName.toLowerCase();
+  let sel = null;
+  if (el.id && /^[A-Za-z_][\\w-]{0,59}$/.test(el.id) && stable(el.id) && unique('#' + el.id)) sel = '#' + el.id;
+  if (!sel) for (const a of ['data-testid', 'data-test', 'data-qa', 'aria-label', 'title']) {
+    const v = el.getAttribute(a);
+    if (v && /^[\\w -]{1,40}$/.test(v)) { const q = tag + '[' + a + '="' + v + '"]'; if (unique(q)) { sel = q; break; } }
+  }
+  if (!sel) {
+    const cls = [...el.classList].filter(c => /^[A-Za-z_][\\w-]{0,59}$/.test(c) && stable(c)).slice(0, 2);
+    if (cls.length) { const q = tag + '.' + cls.join('.'); if (unique(q)) sel = q; }
+  }
+  return { text, selector: sel, banner: !!ctx };
+}"""
+
+JS_IS_GONE = """(q) => {
+  let e = null; try { e = document.querySelector(q); } catch (x) { return false; }
+  if (!e) return true;
+  const r = e.getBoundingClientRect(), st = getComputedStyle(e);
+  return r.width < 2 || r.height < 2 || st.display === 'none' || st.visibility === 'hidden';
+}"""
+
 JS_STEALTH = """() => {
   const c = document.createElement('canvas'); const gl = c.getContext('webgl');
   let vendor = null, renderer = null;
@@ -906,25 +951,57 @@ async def _detect_block(page, status, title) -> str:
 
 
 @tool
-async def navigate(url: str, wait_until: str = "domcontentloaded", settle_ms: int = 500, retries: int = 0) -> str:
+async def navigate(
+    url: str, wait_until: str | None = None, settle_ms: int | None = None, retries: int = 0
+) -> str:
     """Open a URL (http/https; private addresses blocked unless CLOAK_ALLOW_PRIVATE=1). Returns URL, status,
     title and a BLOCKED? hint on bot challenges; retries=N re-tries a blocked page with a fresh identity.
-    To open AND read a page in one call, use read_url."""
+    wait_until (commit|domcontentloaded|load|networkidle) and settle_ms are chosen from what worked on this
+    site before unless you set them. To open AND read a page in one call, use read_url."""
     return await _navigate(url, wait_until, settle_ms, retries)
 
 
-async def _navigate(url: str, wait_until: str = "domcontentloaded", settle_ms: int = 500, retries: int = 0) -> str:
+async def _dismiss_remembered(page, url: str) -> int:
+    """Click pop-up dismissers that worked on this site (or on 3+ sites) before. Returns how many went away."""
+    cands = _mem(MEM.overlay_candidates, url) or []
+    gone_n, deadline = 0, time.monotonic() + 3.0
+    for sel in cands:
+        if time.monotonic() > deadline:
+            break
+        try:
+            loc = page.locator(sel).first
+            if not await loc.is_visible():
+                continue  # this banner is not on the page: nothing to learn either way
+            await loc.click(timeout=1500)
+            await page.wait_for_timeout(250)
+            gone = not await loc.is_visible()
+        except Exception:
+            gone = False
+        _mem(MEM.record_overlay, url, sel, gone, True)
+        gone_n += 1 if gone else 0
+    return gone_n
+
+
+async def _navigate(url: str, wait_until: str | None = None, settle_ms: int | None = None, retries: int = 0) -> str:
     if err := _policy_check(url):
         return f"ERROR: {err}"
     page = await _ensure()
     known = _mem(MEM.hint, url, _cfg_key()) or ""
+    plan = None
+    if wait_until is None and settle_ms is None:  # the caller has no preference: use what worked on this site before
+        plan = _mem(MEM.plan_navigation, url)
+        if plan:
+            wait_until, settle_ms = plan.wait_until, plan.settle_ms
+    wait_until = wait_until or learnlib.ARMS[learnlib.DEFAULT_ARM].wait_until
+    settle_ms = learnlib.ARMS[learnlib.DEFAULT_ARM].settle_ms if settle_ms is None else settle_ms
+    arm = plan.arm if plan else learnlib.arm_for(wait_until, settle_ms)  # None for custom settings: not learned from
     attempt = 0
     while True:
         t0 = time.monotonic()
         try:
             resp = await page.goto(url, wait_until=wait_until, timeout=60000)
         except Exception:
-            _mem(MEM.record_navigation, url, None, False, int((time.monotonic() - t0) * 1000), _cfg_key(), True)
+            _mem(MEM.record_navigation, url, None, False, int((time.monotonic() - t0) * 1000), _cfg_key(), True, arm)
             raise
         if settle_ms:
             await page.wait_for_timeout(settle_ms)
@@ -935,7 +1012,7 @@ async def _navigate(url: str, wait_until: str = "domcontentloaded", settle_ms: i
         title = await page.title()
         status = resp.status if resp else None
         hint = await _detect_block(page, status, title)
-        _mem(MEM.record_navigation, page.url, status, bool(hint), int((time.monotonic() - t0) * 1000), _cfg_key())
+        _mem(MEM.record_navigation, page.url, status, bool(hint), int((time.monotonic() - t0) * 1000), _cfg_key(), False, arm)
         if not hint or attempt >= retries:
             break
         attempt += 1
@@ -947,13 +1024,20 @@ async def _navigate(url: str, wait_until: str = "domcontentloaded", settle_ms: i
             S.cfg["fingerprint_seed"] = random.randint(10000, 99999)
         await _shutdown()
         page = await _ensure()
+    dismissed = 0 if hint else await _dismiss_remembered(page, page.url)
     out = f"{page.url} | status={status if status is not None else '?'} | title={title}"
     if hint:
         out += f" | BLOCKED? {hint}"
     if attempt:
         out += f" | retries={attempt}"
+    if plan and (plan.arm != learnlib.DEFAULT_ARM or plan.reason == "probe"):  # only say so when memory changed something
+        out += f" | memory: {plan.reason} load strategy {learnlib.ARMS[plan.arm].label}"
+    if dismissed:
+        out += f" | memory: dismissed {dismissed} remembered pop-up(s)"
     if known:
         out += f" | {known}"
+    if notice := _mem(MEM.notice):
+        out += f" | {notice}"
     if not MEM.hinted and MEM.should_prompt() and tool_enabled("memory_request_access"):
         MEM.hinted = True
         out += " | MEMORY is off (memory_request_access asks the user to enable it)"
@@ -970,9 +1054,10 @@ async def read_url(
     main_only: bool = True,
     links: str = "keep",
     with_refs: int = 0,
-    wait_until: str = "domcontentloaded",
-    settle_ms: int = 500,
+    wait_until: str | None = None,
+    settle_ms: int | None = None,
     retries: int = 0,
+    use_memory: bool = True,
 ) -> str:
     """Open a URL and read it in ONE call (use instead of navigate + get_markdown). mode: markdown | text.
     query='...' returns only the matching snippets (find_in_page) instead of the whole page. with_refs=N
@@ -987,11 +1072,29 @@ async def read_url(
         parts.append(await find_in_page(query))
     else:
         page = await _ensure()
+        recipe = _mem(MEM.best_extractor, page.url) if use_memory and mode == "markdown" and not offset else None
+        rows = []
+        if recipe:  # an extract_structured recipe that has worked on this kind of page before
+            try:
+                rows = await page.evaluate(JS_EXTRACT, [recipe["item_selector"], recipe["fields"], 50])
+            except Exception:
+                rows = []
+            rows = rows if rows and any(any(v for v in r.values()) for r in rows) else []
         if mode == "markdown":
             body = await _page_markdown(page, "body", main_only, links)
         else:
             body = await page.evaluate("() => document.body.innerText")
-        parts.append(_untrusted(_clip(body, max_chars, offset)))
+        items = json.dumps(rows, ensure_ascii=False) if rows else ""
+        # Use the recipe only when it is cheaper than just reading the page: items + 1500 chars of text + the note.
+        use_recipe = bool(rows) and len(items) + LEARNED_TEXT_CHARS + 200 < min(len(body), max_chars)
+        if recipe:
+            _mem(MEM.record_extractor, page.url, recipe["item_selector"], recipe["fields"], bool(rows), len(rows), use_recipe)
+        if use_recipe:
+            parts.append(_untrusted(f"learned extractor, {len(rows)} items: " + items))
+            parts.append(_untrusted(_clip(body, LEARNED_TEXT_CHARS)))
+            parts.append(f"(memory: a recipe that worked here before produced the items above; page text is cut to {LEARNED_TEXT_CHARS} chars, use_memory=false for the full read)")
+        else:
+            parts.append(_untrusted(_clip(body, max_chars, offset)))
     if with_refs > 0:
         parts.append(await _snapshot(with_refs, "", False, head=False))
     return "\n".join(parts)
@@ -1245,6 +1348,8 @@ async def extract_structured(item_selector: str, fields: dict[str, str], limit: 
     item_selector='li.card', fields={'name':'h2','price':'.price','url':'a@href'}"""
     page = await _ensure()
     rows = await page.evaluate(JS_EXTRACT, [item_selector, fields, limit])
+    good = bool(rows) and any(any(v for v in r.values()) for r in rows)
+    _mem(MEM.record_extractor, page.url, item_selector, fields, good, len(rows) if good else 0)  # learn what works
     return _untrusted(json.dumps({"count": len(rows), "items": rows}, ensure_ascii=False))
 
 
@@ -1372,10 +1477,23 @@ async def click(selector: str, double: bool = False) -> str:
     """Click an element by snapshot ref (e12) or CSS/text selector."""
     page = await _ensure()
     loc = _loc(page, selector)
+    before, info = page.url, None
+    if _mem(MEM.wants_overlay, before):  # is this a cookie/pop-up button? (learn it so next time it goes by itself)
+        try:
+            info = await loc.evaluate(JS_CLICK_INFO, timeout=2000)
+        except Exception:
+            info = None
     if double:
         await loc.dblclick(timeout=15000)
     else:
         await loc.click(timeout=15000)
+    if info and info.get("banner") and info.get("selector") and learnlib.looks_like_dismiss(info.get("text")):
+        try:
+            await page.wait_for_timeout(400)
+            if await page.evaluate(JS_IS_GONE, info["selector"]):  # it really went away: worth remembering
+                _mem(MEM.record_overlay, before, info["selector"], True)
+        except Exception:
+            pass  # the click navigated away or the page closed: nothing to learn
     return f"clicked {selector}; url={page.url}"
 
 

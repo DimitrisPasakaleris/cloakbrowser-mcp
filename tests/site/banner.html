@@ -1,0 +1,12 @@
+<!doctype html><html><head><meta charset="utf-8"><title>Banner Shop</title></head><body>
+<div id="cookie-banner" class="cookie-consent" style="position:fixed;bottom:0;left:0;right:0;background:#eee;padding:10px">
+ <p>We use cookies to improve your experience.</p>
+ <button id="learn-more">Learn more</button>
+ <button id="accept-cookies" class="accept-btn">Accept all</button>
+</div>
+<h1>Banner Shop</h1><p>Products for sale.</p><button id="plain">OK</button>
+<script>
+document.getElementById('accept-cookies').onclick = () => { document.getElementById('cookie-banner').style.display = 'none'; };
+document.getElementById('learn-more').onclick = () => { document.getElementById('plain').textContent = 'more'; };
+document.getElementById('plain').onclick = () => { document.getElementById('plain').textContent = 'clicked'; };
+</script></body></html>
