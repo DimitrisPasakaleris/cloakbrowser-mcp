@@ -15,7 +15,7 @@ def params(home):
     return StdioServerParameters(
         command=sys.executable,
         args=["-m", "cloakbrowser_mcp"],
-        env={"PYTHONUTF8": "1", "CLOAK_MCP_HOME": home, "CLOAK_HUMANIZE": "0"},
+        env={"PYTHONUTF8": "1", "CLOAK_MCP_HOME": home, "CLOAK_HUMANIZE": "0", "CLOAK_MEMORY_TOOLS": "all"},  # all listed up front; e2e_savings.py covers the opt-in gate
     )
 
 

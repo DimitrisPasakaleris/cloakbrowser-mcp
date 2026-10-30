@@ -5,7 +5,7 @@ build-backend = "hatchling.build"
 [project]
 name = "cloakbrowser-mcp"
 dynamic = ["version"]
-description = "MCP server that exposes CloakBrowser stealth Chromium as 58 browser-automation tools"
+description = "MCP server that exposes CloakBrowser stealth Chromium as 61 browser-automation tools (18 in the lean profile)"
 readme = "README.md"
 license = { text = "MIT" }
 requires-python = ">=3.10"
@@ -27,4 +27,4 @@ cloakbrowser-mcp = "cloakbrowser_mcp.cli:main"
 path = "cloakbrowser_mcp/__init__.py"
 
 [tool.hatch.build.targets.sdist]
-include = ["cloakbrowser_mcp", "tests", "README.md", "LICENSE", "e2e.py", "pytest.ini"]
+include = ["cloakbrowser_mcp", "tests", "README.md", "LICENSE", "e2e.py", "e2e_savings.py", "bench_tokens.py", "pytest.ini"]

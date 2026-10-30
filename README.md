@@ -2,7 +2,7 @@
 
 An [MCP](https://modelcontextprotocol.io) server that gives Claude (or any MCP client) a stealth browser. It wraps
 [CloakBrowser](https://github.com/CloakHQ/CloakBrowser), a patched Chromium that passes common bot checks, and exposes
-58 tools for navigation, reading, extraction, interaction, sessions, identity control, debugging and
+61 tools for navigation, reading, extraction, interaction, sessions, identity control, debugging and
 (optional, opt-in) per-site memory.
 
 ## Install
@@ -34,21 +34,52 @@ With `uv`: `claude mcp add cloakbrowser -s user -- uvx --from git+https://github
 
 ## Typical flow
 
-1. `navigate(url)`. If the page looks like a bot challenge the result says `BLOCKED?` and what to try.
+1. `read_url(url)` opens a page and returns it as clean markdown in one call (or `navigate(url)` to just open it).
+   If the page looks like a bot challenge the result says `BLOCKED?` and what to try.
 2. `snapshot()` lists interactive elements with refs (`e12`, or `f2e5` inside an iframe). Refs stay stable while the
-   page stays loaded; `snapshot(diff=True)` shows only what changed.
-3. `click("e12")`, `type_text("e3", "query", submit=True)`.
-4. Read with `get_markdown`, `get_text`, or structured data: `extract_metadata` (JSON-LD / OpenGraph / schema.org
+   page stays loaded; on a big page you already looked at, a repeat `snapshot()` returns only what changed.
+3. `click("e12")`, `type_text("e3", "query", submit=True)`, or several actions in one call with `run_steps`.
+4. Look for one thing with `find_in_page("price")` instead of re-reading the page. Read with `get_markdown` /
+   `get_text` (paged with `offset`), or take structured data: `extract_metadata` (JSON-LD / OpenGraph / schema.org
    product prices), `extract_tables`, `extract_structured`, `extract_links`.
 5. Prefer the JSON API behind a page: `list_network_requests(resource_type="xhr")`, then `get_response_body(i)`.
 
+## Keeping token use low
+
+Every tool *definition* is sent to the model on every turn, and every tool *result* adds to the conversation, so
+both are worth trimming. Measured on this repo (estimates, characters / 4):
+
+- **Tool definitions:** `CLOAK_TOOLS=lean` exposes 18 tools (about 2,000 tokens) instead of 58 (about 6,000).
+  `standard` drops the debug group; `full` (default) has everything. Add single tools to `lean` with
+  `CLOAK_EXTRA_TOOLS=configure,evaluate`. Memory tools stay out of the list until memory is switched on.
+- **Fewer round trips:** `read_url` = navigate + read; `run_steps` runs up to 25 click/type/fill/select/scroll/wait/goto
+  steps in one call and stops at the first failure. Each avoided call saves a full re-send of the conversation.
+- **Smaller results:** `get_markdown` returns the main content only (no menus, footers or cookie banners; `main_only=False`
+  for the whole page), `links="short"|"none"` shrinks link URLs, reads default to 6,000 characters and continue with
+  `offset=`, and `find_in_page` returns just the matching snippets.
+- **Cheaper images:** `screenshot` is a quality-55 JPEG (`format="png"` for lossless; `CLOAK_SHOT_FORMAT`,
+  `CLOAK_SHOT_QUALITY`). `screenshot_file` saves to disk and returns the path.
+- **See where it goes:** `cloakbrowser-mcp stats` summarises the usage log (tool name and result size only, never URLs or
+  page text) and the size of each profile's tool definitions. `CLOAK_USAGE_LOG=0` turns the log off,
+  `cloakbrowser-mcp stats --reset` deletes it.
+
+For Codex (`~/.codex/config.toml`):
+
+```toml
+[mcp_servers.cloakbrowser]
+command = "cloakbrowser-mcp"
+[mcp_servers.cloakbrowser.env]
+PYTHONUTF8 = "1"
+CLOAK_TOOLS = "lean"
+```
+
 ## Tools
 
-Toolsets can be selected with `CLOAK_TOOLSETS` (default: all five).
+Toolsets can be selected with `CLOAK_TOOLSETS` (default: all five), or pick a whole profile with `CLOAK_TOOLS=lean|standard|full`.
 
 | Toolset | Tools |
 |---|---|
-| `core` | `configure`, `close_browser`, `tabs_list`, `tab_new`, `tab_select`, `tab_close`, `navigate`, `go_back`, `reload`, `wait_for`, `snapshot`, `get_text`, `get_markdown`, `screenshot` (optionally annotated with refs), `click`, `hover`, `type_text`, `fill_form`, `press_key`, `select_option`, `scroll` |
+| `core` | `configure`, `close_browser`, `tabs_list`, `tab_new`, `tab_select`, `tab_close`, `navigate`, `read_url`, `run_steps`, `go_back`, `reload`, `wait_for`, `snapshot`, `get_text`, `get_markdown`, `find_in_page`, `screenshot` (optionally annotated with refs), `click`, `hover`, `type_text`, `fill_form`, `press_key`, `select_option`, `scroll` |
 | `extract` | `get_html`, `extract_links`, `extract_structured`, `extract_metadata`, `extract_tables`, `scroll_to_load`, `save_html`, `save_pdf`, `screenshot_file`, `download_file`, `list_downloads`, `check_robots` |
 | `debug` | `console_logs`, `list_network_requests`, `get_response_body`, `check_stealth`, `fingerprint_info`, `evaluate` |
 | `memory` | `memory_request_access`, `memory_status`, `memory_recall`, `memory_remember`, `memory_disable`, `memory_forget`, `memory_audit`, `memory_export`, `memory_incognito` |
@@ -149,7 +180,10 @@ Defaults come from environment variables and can be changed at runtime with `con
 | `CLOAK_GEOIP` | `0` | derive locale/timezone from the proxy IP (needs `cloakbrowser[geoip]`) |
 | `CLOAK_LOCALE`, `CLOAK_TIMEZONE` | none | override, e.g. `el-GR`, `Europe/Athens` |
 | `CLOAK_CAPTURE_CONSOLE` | `0` | enable `console_logs` |
-| `CLOAK_TOOLSETS` | all | comma list of `core,extract,debug,session,memory` |
+| `CLOAK_TOOLS` | `full` | tool profile: `lean` (18 tools), `standard`, `full`; `CLOAK_EXTRA_TOOLS=a,b` adds tools to `lean` |
+| `CLOAK_TOOLSETS` | all | comma list of `core,extract,debug,session,memory` (overrides the profile's groups) |
+| `CLOAK_SHOT_FORMAT`, `CLOAK_SHOT_QUALITY` | `jpeg`, `55` | default screenshot format and JPEG quality |
+| `CLOAK_USAGE_LOG` | `1` | write tool name + result size per call for `cloakbrowser-mcp stats` |
 | `CLOAK_READONLY`, `CLOAK_ALLOW_EVAL`, `CLOAK_ALLOW_PRIVATE`, `CLOAK_ALLOWED_DOMAINS`, `CLOAK_BLOCKED_DOMAINS`, `CLOAK_WRAP_UNTRUSTED` | | see Safety defaults |
 | `CLOAK_MCP_HOME` | `~/.cloakbrowser-mcp` | profiles, sessions, output files, logs |
 
@@ -168,7 +202,9 @@ Defaults come from environment variables and can be changed at runtime with `con
 
 ```bash
 python -m venv .venv && .venv/bin/pip install -e ".[dev]"     # Windows: .venv\Scripts\pip
-pytest -q                 # 170+ tests against a local static site and the MCP protocol
+pytest -q                 # 220+ tests against a local static site and the MCP protocol
 python e2e.py             # stdio MCP client against live Skroutz (needs network)
 python e2e_memory.py      # consent prompt + memory over real MCP stdio, in a temp home
+python e2e_savings.py     # lean profile, read_url/run_steps, scaled screenshots, usage log, opt-in memory tools
+python bench_tokens.py URL...   # before/after token estimates on real pages
 ```

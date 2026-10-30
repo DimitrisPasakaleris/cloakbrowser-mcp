@@ -167,10 +167,10 @@ async def test_annotated_screenshot(srv, base_url):
     await srv.navigate(base_url + "/frames.html", wait_until="load")
     plain = await srv.screenshot()
     marked = await srv.screenshot(annotate=True)
-    assert marked.data[:4] == b"\x89PNG" and marked.data != plain.data
+    assert marked.data[:2] == b"\xff\xd8" and marked.data != plain.data
     assert U(await srv.evaluate("() => document.getElementById('__cm_overlay') === null")) == "true"
     path = await srv.screenshot_file("marked.png", annotate=True)
-    assert Path(path).read_bytes()[:4] == b"\x89PNG"
+    assert Path(path).read_bytes()[:4] == b"\x89PNG"  # the extension picks the format
 
 
 # ------------------------------------------------------------------ fingerprint

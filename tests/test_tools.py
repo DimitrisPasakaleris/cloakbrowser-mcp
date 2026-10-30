@@ -101,9 +101,10 @@ async def test_evaluate_and_screenshot(srv):
     assert U(await srv.evaluate("1+2")) == "3"
     assert U(await srv.evaluate("() => document.title")) == '"Test Shop"'
     img = await srv.screenshot()
-    assert img.data[:4] == b"\x89PNG"
+    assert img.data[:2] == b"\xff\xd8"  # JPEG by default (small); png on request
     el = await srv.screenshot(selector="h1")
-    assert el.data[:4] == b"\x89PNG"
+    assert el.data[:2] == b"\xff\xd8"
+    assert (await srv.screenshot(format="png")).data[:4] == b"\x89PNG"
 
 
 async def test_files(srv):
