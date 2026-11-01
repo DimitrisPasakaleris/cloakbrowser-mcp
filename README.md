@@ -81,7 +81,7 @@ Toolsets can be selected with `CLOAK_TOOLSETS` (default: all five), or pick a wh
 |---|---|
 | `core` | `configure`, `close_browser`, `tabs_list`, `tab_new`, `tab_select`, `tab_close`, `navigate`, `read_url`, `run_steps`, `go_back`, `reload`, `wait_for`, `snapshot`, `get_text`, `get_markdown`, `find_in_page`, `screenshot` (optionally annotated with refs), `click`, `hover`, `type_text`, `fill_form`, `press_key`, `select_option`, `scroll` |
 | `extract` | `get_html`, `extract_links`, `extract_structured`, `extract_metadata`, `extract_tables`, `scroll_to_load`, `save_html`, `save_pdf`, `screenshot_file`, `download_file`, `list_downloads`, `check_robots` |
-| `debug` | `console_logs`, `list_network_requests`, `get_response_body`, `check_stealth`, `fingerprint_info`, `evaluate` |
+| `debug` | `console_logs`, `list_network_requests`, `get_response_body`, `check_stealth`, `stealth_audit`, `fingerprint_info`, `evaluate` |
 | `memory` | `memory_request_access`, `memory_status`, `memory_recall`, `memory_remember`, `memory_disable`, `memory_forget`, `memory_audit`, `memory_export`, `memory_incognito` |
 | `session` | `rotate_proxy`, `new_identity`, `request_human`, `handle_dialog`, `upload_file`, `get_cookies`, `set_cookies`, `clear_cookies`, `save_session`, `load_session` |
 
@@ -107,6 +107,27 @@ fields = {"name": "h2", "price": ".price", "url": "a@href"}
   a list, otherwise a new fingerprint).
 - `configure(headless=False)` + `request_human()` lets you solve a captcha in a real window. This server does not
   use captcha-solving services.
+
+## Stealth audit
+
+`stealth_audit()` runs ~40 checks inside the live session and returns FAIL / WARN findings with what a site could see:
+`webdriver`, automation globals, CDP `Runtime.enable`, native-code shape of patched functions, iframe and Web Worker
+consistency, UA vs client hints, language list, window geometry, WebRTC candidates, the request headers a server
+receives, and the browser timezone against the exit IP's. `network=False` skips the two checks that call outside services.
+From the shell: `python audit/probe.py [--headed] [--proxy URL] [--tz Area/City]`.
+
+What this server leaves in a page (random names per process, so there is no fixed marker to search for): a ref
+attribute on snapshotted elements, a closed-shadow-root overlay while an annotated screenshot is taken, and with
+`capture_console` a Proxy around `console.*` plus a hidden buffer. `request_human(banner=False)` injects nothing.
+
+Findings that are **not** fixable from here (measured with `audit/experiments.py`):
+
+- **WebRTC returns no ICE candidates** on this build, with or without our flags; a stock Chrome on the same machine
+  returns mDNS host candidates. Report upstream; sites that probe WebRTC can see the difference.
+- **Single-language list.** Fixing it with `CLOAK_LANGUAGES` makes pages report several languages while Web Workers
+  still report one, which fingerprinters flag as a lie, so it is off by default. Setting a UA override *without* the
+  client-hint metadata is worse: it drops `Sec-CH-UA` and reshuffles the brand list.
+- With `capture_console` on, `console.log.toString()` is `function () { [native code] }` (a Proxy has no name).
 
 ## Memory (on by default, local, and it learns)
 
@@ -215,8 +236,9 @@ Defaults come from environment variables and can be changed at runtime with `con
 | `CLOAK_PROXY` / `CLOAK_PROXIES` | none | one proxy URL / comma-separated rotation list |
 | `CLOAK_PROFILE` | none | named persistent profile |
 | `CLOAK_FINGERPRINT` | random | fixed fingerprint seed |
-| `CLOAK_GEOIP` | `0` | derive locale/timezone from the proxy IP (needs `cloakbrowser[geoip]`) |
-| `CLOAK_LOCALE`, `CLOAK_TIMEZONE` | none | override, e.g. `el-GR`, `Europe/Athens` |
+| `CLOAK_GEOIP` | automatic | derive locale/timezone from the proxy IP. Unset = on whenever a proxy is set (falls back to off with a log line if the geoip data is missing); `0`/`1` forces it |
+| `CLOAK_LOCALE`, `CLOAK_TIMEZONE` | none | override, e.g. `el-GR`, `Europe/Athens`. `CLOAK_TIMEZONE=auto` follows the timezone of your public IP (one request to ipinfo.io; direct connection only) |
+| `CLOAK_LANGUAGES` | `off` | `auto` or a list such as `el-GR,el,en-US,en`: multi-language `navigator.languages` and `Accept-Language`. Opt-in because workers keep reporting one language (see Stealth) |
 | `CLOAK_CAPTURE_CONSOLE` | `0` | enable `console_logs` |
 | `CLOAK_TOOLS` | `full` | tool profile: `lean` (18 tools), `standard`, `full`; `CLOAK_EXTRA_TOOLS=a,b` adds tools to `lean` |
 | `CLOAK_TOOLSETS` | all | comma list of `core,extract,debug,session,memory` (overrides the profile's groups) |
@@ -232,7 +254,7 @@ Defaults come from environment variables and can be changed at runtime with `con
   page hook that slightly lowers stealth.
 - CloakBrowser cancels the browser's own download handling, so clicking a download link saves nothing. Use
   `download_file`, which fetches inside the page (same cookies and proxy; for cross-origin files visit that site first).
-- `request_human` needs a visible window: `configure(headless=False)`.
+- `request_human` needs a visible window: `configure(headless=False)`. It returns when you click Done, when the page navigates (a solved captcha reloads it) or when the captcha widget disappears; a minimised window is restored first.
 - The free CloakBrowser binary allows one concurrent session; this server uses one browser with tabs.
 - CloakBrowser checks PyPI for updates when it launches.
 - The CloakBrowser binary has its own license (see its BINARY-LICENSE.md). This repository's code is MIT.

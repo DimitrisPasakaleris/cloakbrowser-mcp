@@ -22,12 +22,14 @@ import json
 import logging
 import os
 import random
+import secrets
 import time
 import re
 import socket
 import struct
 import ipaddress
 import urllib.parse
+import urllib.request
 import urllib.robotparser
 from collections import deque
 from logging.handlers import RotatingFileHandler
@@ -48,6 +50,21 @@ SESS_DIR = HOME / "sessions"
 DL_DIR = OUT_DIR / "downloads"
 for _d in (PROFILES, OUT_DIR, LOG_DIR, SESS_DIR, DL_DIR):
     _d.mkdir(parents=True, exist_ok=True)
+
+# Names of everything this server leaves inside a page. They are random per process so that a site
+# cannot look for one fixed marker ("data-cm-ref", "__cm_console", ...) to recognise the automation.
+_MARK = "k" + secrets.token_hex(5)
+REF_ATTR = f"data-{_MARK}"
+OVERLAY_ID = f"{_MARK}o"
+CONSOLE_KEY = f"{_MARK}c"
+COUNTER_KEY = f"{_MARK}n"
+
+
+def _marked(js: str) -> str:
+    """Fill the per-process marker names into a JS snippet."""
+    return (js.replace("__REF__", REF_ATTR).replace("__OVL__", OVERLAY_ID)
+            .replace("__CON__", CONSOLE_KEY).replace("__CNT__", COUNTER_KEY))
+
 
 _SECRET_RX = [
     (re.compile(r"(//)[^/@\s:]+:[^/@\s]+@"), r"\1***@"),
@@ -88,7 +105,7 @@ class State:
         self.cfg = {
             "headless": _env_bool("CLOAK_HEADLESS", True),
             "humanize": _env_bool("CLOAK_HUMANIZE", True),
-            "geoip": _env_bool("CLOAK_GEOIP", False),
+            "geoip": _env_bool("CLOAK_GEOIP", False) if "CLOAK_GEOIP" in os.environ else None,  # None = on whenever a proxy is set
             "proxy": os.environ.get("CLOAK_PROXY") or None,
             "profile": os.environ.get("CLOAK_PROFILE") or None,
             "locale": os.environ.get("CLOAK_LOCALE") or None,
@@ -117,6 +134,7 @@ class State:
         self.downloads = []
         self.last_snap = {}  # page id -> (url, set of snapshot lines) for diff mode
         self.snap_frames = {}  # frame index -> Frame, from the latest snapshot
+        self.ua_profile = None  # UA, client-hint metadata and Accept-Language the language override applied
         self.dialog_policy = "accept"
         self.dialogs = deque(maxlen=20)
         self.lock = asyncio.Lock()
@@ -267,15 +285,130 @@ def _fingerprint_args() -> list[str]:
     return out
 
 
+def _language_list(primary: str) -> list[str]:
+    """The list a real Chrome reports: the UI language, its base language, then English."""
+    out = []
+    for lang in (primary, primary.split("-")[0], "en-US", "en"):
+        if lang and lang not in out:
+            out.append(lang)
+    return out
+
+
+# Page-less secure origin used to read the client-hint metadata without touching the network.
+_SECURE_STUB = "https://cloak-stub.invalid/"
+
+
+async def _read_ua_profile(ctx):
+    """Read the UA, navigator.language and client-hint metadata the browser really reports."""
+    page = await ctx.new_page()
+    try:
+        async def stub(route):
+            await route.fulfill(status=200, content_type="text/html", body="<!doctype html><title>x</title>")
+        await page.route(_SECURE_STUB + "**", stub)
+        await page.goto(_SECURE_STUB, wait_until="domcontentloaded", timeout=15000)
+        return await page.evaluate("""async () => {
+          const u = navigator.userAgentData, h = await u.getHighEntropyValues(['platformVersion','architecture','bitness','model','fullVersionList','wow64']);
+          return {ua: navigator.userAgent, lang: navigator.language, langs: navigator.languages.length, meta: {brands: u.brands, fullVersionList: h.fullVersionList,
+            platform: u.platform, platformVersion: h.platformVersion, architecture: h.architecture, model: h.model, mobile: u.mobile, bitness: h.bitness, wow64: h.wow64}};
+        }""")
+    finally:
+        await page.close()
+
+
+async def _apply_languages(ctx) -> None:
+    """Opt-in (CLOAK_LANGUAGES=auto, or an explicit list "el-GR,el,en-US,en"): give navigator.languages and
+    Accept-Language a multi-language list like a stock Chrome.
+
+    OFF by default because of a measured trade-off: the only lever is Emulation.setUserAgentOverride, which
+    applies to pages but not to Web Workers, so a worker still reports one language and a fingerprinter that
+    compares window and worker sees a mismatch (stealth_audit reports it as worker-mismatch). A single
+    language is the smaller tell. Calling the override with only a UA string also drops Sec-CH-UA, so it is
+    always sent together with the client-hint metadata the browser already reports. Best effort."""
+    mode = os.environ.get("CLOAK_LANGUAGES", "off").strip()
+    if mode.lower() == "off":
+        return
+    try:
+        prof = await _read_ua_profile(ctx)
+        if mode.lower() != "auto":
+            langs = [x.strip() for x in mode.split(",") if x.strip()]
+        elif prof["langs"] > 1:
+            return  # the browser already reports a list
+        else:
+            langs = _language_list(S.cfg["locale"] or prof["lang"])
+        S.ua_profile = {"ua": prof["ua"], "meta": prof["meta"], "accept": ",".join(langs)}
+
+        async def apply(page):
+            try:
+                cdp = await ctx.new_cdp_session(page)
+                await cdp.send("Emulation.setUserAgentOverride", {
+                    "userAgent": prof["ua"], "acceptLanguage": S.ua_profile["accept"], "userAgentMetadata": prof["meta"]})
+            except Exception:
+                log.warning("language override failed for a page", exc_info=True)
+
+        for p in ctx.pages:
+            await apply(p)
+        ctx.on("page", lambda p: asyncio.ensure_future(apply(p)))
+    except Exception:
+        log.warning("could not apply the language list; continuing without it", exc_info=True)
+
+
+async def _restore_window(page) -> bool:
+    """Un-minimise a headed window. A minimised window reports outerWidth 160 x outerHeight 28."""
+    if S.cfg["headless"]:
+        return False
+    cdp = None
+    try:
+        cdp = await page.context.new_cdp_session(page)
+        win = await cdp.send("Browser.getWindowForTarget")
+        if win.get("bounds", {}).get("windowState") in ("minimized", "fullscreen") or win["bounds"].get("width", 999) < 300:
+            await cdp.send("Browser.setWindowBounds", {"windowId": win["windowId"], "bounds": {"windowState": "normal"}})
+            return True
+    except Exception:
+        log.debug("window restore failed", exc_info=True)
+    finally:
+        if cdp is not None:
+            try:
+                await cdp.detach()
+            except Exception:
+                pass
+    return False
+
+
+_TZ_CACHE: dict = {}
+
+
+def _ip_timezone() -> str | None:
+    """IANA timezone of this machine's public IP (direct connection only), cached for ten minutes.
+    One request to ipinfo.io, which sees the IP; that is why it is opt-in (timezone='auto')."""
+    hit = _TZ_CACHE.get("tz")
+    if hit and time.time() - hit[1] < 600:
+        return hit[0]
+    try:
+        req = urllib.request.Request("https://ipinfo.io/json", headers={"User-Agent": "cloakbrowser-mcp"})
+        with urllib.request.urlopen(req, timeout=8) as r:
+            tz = json.load(r).get("timezone")
+    except Exception:
+        log.warning("timezone lookup failed; using the machine timezone", exc_info=True)
+        return None
+    if isinstance(tz, str) and re.fullmatch(r"[A-Za-z_]+(/[A-Za-z_+\-0-9]+){1,2}", tz):
+        _TZ_CACHE["tz"] = (tz, time.time())
+        return tz
+    return None
+
+
 async def _launch():
     c = S.cfg
+    geoip = c["geoip"] if c["geoip"] is not None else bool(c["proxy"])
+    tz = c["timezone"]
+    if tz == "auto":
+        tz = None if c["proxy"] else await asyncio.to_thread(_ip_timezone)  # with a proxy, geoip handles it
     kw = {
         "headless": c["headless"],
         "humanize": c["humanize"],
-        "geoip": c["geoip"],
+        "geoip": geoip,
         "proxy": c["proxy"],
         "locale": c["locale"],
-        "timezone": c["timezone"],
+        "timezone": tz,
     }
     fp = _fingerprint_args()
     if fp:
@@ -284,11 +417,21 @@ async def _launch():
         kw["human_preset"] = c["human_preset"]
         kw["human_config"] = c["human_config"]
     kw = {k: v for k, v in kw.items() if v is not None}
-    if c["profile"]:
-        safe = re.sub(r"[^A-Za-z0-9_.-]", "_", c["profile"])
-        ctx = await launch_persistent_context_async(str(PROFILES / safe), **kw)
-    else:
-        ctx = await launch_context_async(**kw)
+
+    async def open_ctx(options):
+        if c["profile"]:
+            safe = re.sub(r"[^A-Za-z0-9_.-]", "_", c["profile"])
+            return await launch_persistent_context_async(str(PROFILES / safe), **options)
+        return await launch_context_async(**options)
+
+    try:
+        ctx = await open_ctx(kw)
+    except Exception:
+        if not (geoip and c["geoip"] is None):
+            raise
+        # geoip was switched on automatically for the proxy; if its data is unavailable, still launch
+        log.warning("geoip lookup failed; launching without it (timezone and locale may not match the proxy)", exc_info=True)
+        ctx = await open_ctx({**kw, "geoip": False})
     if c["capture_console"]:
         await ctx.add_init_script(JS_CONSOLE_HOOK)
     S.ctx = ctx
@@ -298,9 +441,13 @@ async def _launch():
     S.responses.clear()
     S.last_snap.clear()
     S.snap_frames.clear()
+    S.ua_profile = None
+    await _apply_languages(ctx)
     for p in ctx.pages:
         _register_page(p)
     ctx.on("page", _register_page)
+    if not c["headless"] and ctx.pages:
+        await _restore_window(ctx.pages[0])
     log.info("browser launched cfg=%s", {k: v for k, v in c.items() if k != "proxy"})
 
 
@@ -354,7 +501,7 @@ TOOLSET_MEMBERS = {
         "save_html", "save_pdf", "screenshot_file", "list_downloads", "download_file", "check_robots",
     },
     "debug": {
-        "console_logs", "list_network_requests", "get_response_body", "check_stealth", "fingerprint_info", "evaluate",
+        "console_logs", "list_network_requests", "get_response_body", "check_stealth", "stealth_audit", "fingerprint_info", "evaluate",
     },
     "memory": {
         "memory_request_access", "memory_status", "memory_disable", "memory_forget", "memory_audit",
@@ -372,7 +519,7 @@ ACT_TOOLS = {
 READ_ONLY_TOOLS = {
     "tabs_list", "snapshot", "find_in_page", "get_text", "get_html", "get_markdown", "extract_links", "extract_structured",
     "extract_metadata", "extract_tables", "screenshot", "screenshot_file", "list_downloads", "check_robots",
-    "console_logs", "list_network_requests", "get_response_body", "check_stealth", "fingerprint_info", "get_cookies",
+    "console_logs", "list_network_requests", "get_response_body", "check_stealth", "stealth_audit", "fingerprint_info", "get_cookies",
     "save_html", "save_pdf", "memory_status", "memory_audit", "memory_recall",
 }
 
@@ -572,13 +719,13 @@ def _clip(s: str, n: int, offset: int = 0) -> str:
 def _loc(page, target: str):
     """Resolve a snapshot ref (e12, or f2e5 for elements inside iframe #2) or any Playwright selector."""
     if re.fullmatch(r"e\d+", target):
-        return page.locator(f'[data-cm-ref="{target}"]').first
+        return page.locator(f'[{REF_ATTR}="{target}"]').first
     m = re.fullmatch(r"f(\d+)(e\d+)", target)
     if m:
         frame = S.snap_frames.get(int(m.group(1)))
         if frame is None or frame.is_detached():
             raise ValueError(f"ref {target}: frame is gone; take a fresh snapshot")
-        return frame.locator(f'[data-cm-ref="{m.group(2)}"]').first
+        return frame.locator(f'[{REF_ATTR}="{m.group(2)}"]').first
     return page.locator(target).first
 
 
@@ -588,15 +735,15 @@ JS_SNAPSHOT = """([max, scope]) => {
   const base = scope ? document.querySelector(scope) : document;
   if (!base) return {title: document.title, url: location.href, items: [], error: 'scope not found'};
   function* roots(r) { yield r; for (const h of r.querySelectorAll('*')) if (h.shadowRoot) yield* roots(h.shadowRoot); }
-  window.__cm_n = window.__cm_n || 0;
+  if (!Object.prototype.hasOwnProperty.call(window, '__CNT__')) Object.defineProperty(window, '__CNT__', {value: 0, writable: true, enumerable: false, configurable: true});
   const out = [];
   for (const root of roots(base)) {
     for (const el of root.querySelectorAll(sel)) {
       const r = el.getBoundingClientRect(); const st = getComputedStyle(el);
       if (r.width < 2 || r.height < 2 || st.visibility === 'hidden' || st.display === 'none') continue;
       if (out.length >= max) break;
-      let ref = el.getAttribute('data-cm-ref');
-      if (!ref) { ref = 'e' + (++window.__cm_n); el.setAttribute('data-cm-ref', ref); }
+      let ref = el.getAttribute('__REF__');
+      if (!ref) { ref = 'e' + (++window['__CNT__']); el.setAttribute('__REF__', ref); }
       const tag = el.tagName.toLowerCase();
       const label = (el.getAttribute('aria-label') || el.innerText || el.placeholder || el.value || el.title || el.alt || el.name || '').trim().replace(/\\s+/g, ' ').slice(0, 80);
       const o = {ref, tag, label};
@@ -611,19 +758,23 @@ JS_SNAPSHOT = """([max, scope]) => {
 }"""
 
 JS_OVERLAY = """() => {
-  const o = document.createElement('div'); o.id = '__cm_overlay';
-  o.style.cssText = 'position:fixed;inset:0;pointer-events:none;z-index:2147483647';
-  for (const el of document.querySelectorAll('[data-cm-ref]')) {
+  const host = document.createElement('div'); host.id = '__OVL__';
+  host.style.cssText = 'position:fixed;inset:0;pointer-events:none;z-index:2147483647';
+  const o = host.attachShadow({mode: 'closed'});  // closed: the page cannot read the boxes back
+  for (const el of document.querySelectorAll('[__REF__]')) {
     const r = el.getBoundingClientRect();
     if (r.width < 2 || r.height < 2 || r.bottom < 0 || r.top > innerHeight || r.right < 0 || r.left > innerWidth) continue;
     const b = document.createElement('div');
     b.style.cssText = `position:absolute;left:${r.left}px;top:${r.top}px;width:${r.width}px;height:${r.height}px;outline:2px solid #e11d48`;
-    const l = document.createElement('span'); l.textContent = el.getAttribute('data-cm-ref');
+    const l = document.createElement('span'); l.textContent = el.getAttribute('__REF__');
     l.style.cssText = 'position:absolute;left:0;top:-14px;background:#e11d48;color:#fff;font:bold 11px sans-serif;padding:0 3px';
     b.appendChild(l); o.appendChild(b);
   }
-  document.documentElement.appendChild(o);
+  document.documentElement.appendChild(host);
 }"""
+JS_SNAPSHOT = _marked(JS_SNAPSHOT)
+JS_OVERLAY = _marked(JS_OVERLAY)
+JS_OVERLAY_REMOVE = _marked("() => { const o = document.getElementById('__OVL__'); if (o) o.remove(); }")
 
 JS_METADATA = """() => {
   const out = {title: document.title, canonical: (document.querySelector('link[rel=canonical]') || {}).href || null,
@@ -759,15 +910,22 @@ JS_STEALTH = """() => {
 
 # CloakBrowser suppresses CDP console events (stealth), so console capture is an opt-in page hook.
 JS_CONSOLE_HOOK = """(() => {
-  if (window.__cm_console) return;
-  const buf = window.__cm_console = [];
+  if (Object.prototype.hasOwnProperty.call(window, '__CON__')) return;
+  const buf = [];
+  Object.defineProperty(window, '__CON__', {value: buf, enumerable: false, configurable: true});
   for (const k of ['log','info','warn','error','debug']) {
-    const orig = console[k].bind(console);
-    console[k] = (...a) => { try { buf.push({type: k, text: a.map(x => typeof x === 'string' ? x : JSON.stringify(x)).join(' ').slice(0, 500)}); if (buf.length > 300) buf.shift(); } catch (e) {} orig(...a); };
+    // A Proxy around the real function keeps .name, .length and the prototype chain intact; a plain
+    // arrow function would print its own source from toString() and have an empty name.
+    console[k] = new Proxy(console[k], {apply(t, self, a) {
+      try { buf.push({type: k, text: a.map(x => typeof x === 'string' ? x : JSON.stringify(x)).join(' ').slice(0, 500)}); if (buf.length > 300) buf.shift(); } catch (e) {}
+      return Reflect.apply(t, self, a);
+    }});
   }
   addEventListener('error', e => buf.push({type: 'pageerror', text: String(e.message).slice(0, 500)}));
   addEventListener('unhandledrejection', e => buf.push({type: 'pageerror', text: 'unhandled rejection: ' + String(e.reason).slice(0, 400)}));
 })();"""
+JS_CONSOLE_HOOK = _marked(JS_CONSOLE_HOOK)
+JS_CONSOLE_READ = _marked("(c) => { const b = window['__CON__'] || []; const r = b.slice(); if (c) b.length = 0; return r; }")
 
 
 # ---------------------------------------------------------------- config
@@ -795,7 +953,8 @@ async def configure(
     restart: bool = True,
 ) -> str:
     """Change browser settings at runtime (restarts the browser; no args = show current). profile='name'
-    keeps cookies/logins ('' = throwaway); proxy='' clears it; headless=False shows a window (captchas);
+    keeps cookies/logins ('' = throwaway); proxy='' clears it; timezone='auto' uses the timezone of your
+    public IP (no proxy; with a proxy geoip is automatic); headless=False shows a window (captchas);
     capture_console=True enables console_logs; human_preset/human_config tune humanize; fingerprint_seed
     pins an identity, platform/gpu_vendor/hardware_concurrency/screen_*/brand override parts of it;
     reset_fingerprint=True clears overrides."""
@@ -1435,7 +1594,7 @@ async def _shot(
         return await page.screenshot(full_page=full_page, **opts)
     finally:
         if annotate:
-            await page.evaluate("() => { const o = document.getElementById('__cm_overlay'); if (o) o.remove(); }")
+            await page.evaluate(JS_OVERLAY_REMOVE)
 
 
 @tool
@@ -1617,24 +1776,72 @@ async def evaluate(script: str) -> str:
 
 
 @tool
-async def request_human(message: str = "Please complete the step, then click Done.", timeout_s: int = 180) -> str:
+async def request_human(
+    message: str = "Please complete the step, then click Done.", timeout_s: int = 180, banner: bool = True
+) -> str:
     """Pause for a human (captcha, login, 2FA). Needs a visible window: configure(headless=False) first.
-    Shows a banner with a Done button and waits for the click."""
+    Returns when the person clicks Done on the banner, when the page navigates (a solved captcha usually
+    reloads the page) or when a captcha widget disappears. banner=False injects nothing into the page and
+    relies on the navigation/widget signals only (the stealthiest option; use it on sensitive sites)."""
     page = await _ensure()
     if S.cfg["headless"]:
         return "ERROR: browser is headless; call configure(headless=False) and navigate again, then retry"
-    js = """(msg) => new Promise(res => {
-      const b = document.createElement('div');
-      b.style.cssText = 'position:fixed;top:0;left:0;right:0;z-index:2147483647;background:#fde68a;color:#000;padding:10px;font:14px sans-serif;display:flex;gap:12px;align-items:center';
-      b.textContent = msg; const btn = document.createElement('button'); btn.textContent = 'Done';
-      btn.onclick = () => { b.remove(); res('done'); }; b.appendChild(btn); document.documentElement.appendChild(b);
-    })"""
+    restored = await _restore_window(page)
+    start_url = page.url
     try:
-        await asyncio.wait_for(page.evaluate(js, message), timeout=timeout_s)
-        _mem(MEM.record_human, page.url)
-        return f"human finished; url={page.url}"
-    except asyncio.TimeoutError:
+        had_widget = bool(await page.evaluate(JS_CAPTCHA_WIDGETS))
+    except Exception:
+        had_widget = False
+    js = _marked("""(msg) => new Promise(res => {
+      const host = document.createElement('div'); host.id = '__OVL__b';
+      host.style.cssText = 'position:fixed;top:0;left:0;right:0;z-index:2147483647';
+      const root = host.attachShadow({mode: 'closed'});
+      const b = document.createElement('div');
+      b.style.cssText = 'background:#fde68a;color:#000;padding:10px;font:14px sans-serif;display:flex;gap:12px;align-items:center';
+      b.textContent = msg; const btn = document.createElement('button'); btn.textContent = 'Done';
+      btn.onclick = () => { host.remove(); res('done'); }; b.appendChild(btn); root.appendChild(b); document.documentElement.appendChild(host);
+    })""")
+
+    async def banner_task():
+        try:
+            return await page.evaluate(js, message)
+        except Exception:  # navigation destroys the page context while the banner is open: that is a result, not an error
+            return "page navigated"
+
+    async def watch_task():
+        while True:
+            await asyncio.sleep(1.0)
+            if page.is_closed():
+                return "page closed"
+            try:
+                if page.url != start_url:
+                    return "page navigated"
+                if had_widget and not await page.evaluate(JS_CAPTCHA_WIDGETS):
+                    return "challenge cleared"
+            except Exception:
+                return "page navigated"
+
+    tasks = [asyncio.ensure_future(watch_task())]
+    if banner:
+        tasks.append(asyncio.ensure_future(banner_task()))
+    try:
+        done, _ = await asyncio.wait(tasks, timeout=timeout_s, return_when=asyncio.FIRST_COMPLETED)
+    finally:
+        for t in tasks:
+            if not t.done():
+                t.cancel()
+    if not done:
         return "ERROR: timed out waiting for human"
+    how = next(iter(done)).result()
+    try:
+        await page.wait_for_load_state("domcontentloaded", timeout=10000)
+        if banner and how != "done":
+            await page.evaluate(_marked("() => { const o = document.getElementById('__OVL__b'); if (o) o.remove(); }"))
+    except Exception:
+        pass
+    _mem(MEM.record_human, page.url)
+    note = " (window restored first)" if restored else ""
+    return f"human finished ({how}){note}; url={page.url}"
 
 
 # ---------------------------------------------------------------- cookies
@@ -1672,7 +1879,7 @@ async def console_logs(limit: int = 50, clear: bool = False) -> str:
     page = await _ensure()
     if not S.cfg["capture_console"]:
         return "ERROR: console capture is off; call configure(capture_console=True) and reload the page"
-    out = await page.evaluate("(c) => { const b = window.__cm_console || []; const r = b.slice(); if (c) b.length = 0; return r; }", clear)
+    out = await page.evaluate(JS_CONSOLE_READ, clear)
     return _untrusted(json.dumps(out[-limit:], ensure_ascii=False))
 
 
@@ -1708,6 +1915,31 @@ async def check_stealth() -> str:
     """Report automation-detection signals of the live session (webdriver flag, UA, WebGL, plugins...)."""
     page = await _ensure()
     return json.dumps(await page.evaluate(JS_STEALTH), ensure_ascii=False)
+
+
+_PROBES_JS = (Path(__file__).parent / "probes.js").read_text(encoding="utf-8")
+
+
+@tool
+async def stealth_audit(network: bool = True) -> str:
+    """Audit the live session for automation leaks: ~40 checks (webdriver, native-code integrity, iframe/worker
+    consistency, UA vs client hints, language list, window geometry, WebRTC, request headers, timezone vs the
+    exit IP, page markers). Returns findings sorted FAIL first, each with what a site could see. network=False
+    skips the checks that call external services (request headers, IP geolocation)."""
+    page = await _ensure()
+    if not page.url.startswith(("https://", "http://127.0.0.1", "http://localhost")):
+        await page.goto("https://example.com/", wait_until="domcontentloaded", timeout=30000)  # client hints need a secure page
+    res = await page.evaluate(_PROBES_JS, {"network": network})
+    order = {"FAIL": 0, "WARN": 1}
+    findings = sorted(res["findings"], key=lambda f: order.get(f["verdict"], 2))
+    raw = res["raw"]
+    summary = {
+        "fail": sum(f["verdict"] == "FAIL" for f in findings), "warn": sum(f["verdict"] == "WARN" for f in findings),
+        "findings": findings,
+        "seen_by_sites": {k: raw.get(k) for k in ("ua", "langs", "tz", "locale", "screen", "geo")},
+        "config": {k: S.cfg[k] for k in ("headless", "humanize", "geoip", "locale", "timezone", "capture_console")} | {"proxy": bool(S.cfg["proxy"])},
+    }
+    return json.dumps(summary, ensure_ascii=False)
 
 
 # ---------------------------------------------------------------- structured extraction

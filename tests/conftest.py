@@ -34,6 +34,15 @@ class Handler(http.server.SimpleHTTPRequestHandler):
             self.send_header("Content-Length", str(len(body)))
             self.end_headers()
             self.wfile.write(body)
+        elif self.path.startswith("/echo-headers"):
+            import json as _json
+            body = _json.dumps({k: v for k, v in self.headers.items()}).encode()
+            self.send_response(200)
+            self.send_header("Content-Type", "application/json")
+            self.send_header("Access-Control-Allow-Origin", "*")
+            self.send_header("Content-Length", str(len(body)))
+            self.end_headers()
+            self.wfile.write(body)
         elif self.path.startswith("/redir"):
             self.send_response(302)
             self.send_header("Location", f"http://localhost:{self.server.server_address[1]}/page2.html")

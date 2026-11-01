@@ -236,7 +236,7 @@ async def test_scaled_screenshot_element_and_full_page(srv, base_url):
     assert fh >= page_h - 2 and fh > 947 and abs(sw - 600) <= 1 and abs(sh - fh * sw / fw) <= 2  # whole page, scaled
     ann = await srv.screenshot(annotate=True)
     assert srv._image_size(ann.data)[0] <= srv.SHOT_MAX_WIDTH + 1
-    assert U(await srv.evaluate("() => document.getElementById('__cm_overlay') === null")) == "true"
+    assert U(await srv.evaluate("() => document.getElementById('" + srv.OVERLAY_ID + "') === null")) == "true"
 
 
 async def test_screenshot_file_follows_extension(srv, base_url):

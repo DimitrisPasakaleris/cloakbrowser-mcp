@@ -168,7 +168,7 @@ async def test_annotated_screenshot(srv, base_url):
     plain = await srv.screenshot()
     marked = await srv.screenshot(annotate=True)
     assert marked.data[:2] == b"\xff\xd8" and marked.data != plain.data
-    assert U(await srv.evaluate("() => document.getElementById('__cm_overlay') === null")) == "true"
+    assert U(await srv.evaluate("() => document.getElementById('" + srv.OVERLAY_ID + "') === null")) == "true"
     path = await srv.screenshot_file("marked.png", annotate=True)
     assert Path(path).read_bytes()[:4] == b"\x89PNG"  # the extension picks the format
 
