@@ -213,3 +213,60 @@ async def test_contact_sheet_validates_input(srv, base_url):
     assert "ERROR" in str(await srv.contact_sheet(columns=0))
     assert "ERROR" in str(await srv.contact_sheet(columns=6, cell_width=500))
     assert "ERROR" in str(await srv.contact_sheet(list(range(1, srv.MANY_MAX + 2))))
+
+
+# ---------------------------------------------------------------- scroll_collect
+async def test_virtual_list_loses_items_without_scroll_collect(srv, base_url):
+    """Baseline: the page really unloads rows, so a plain link read after scrolling sees only the window."""
+    await srv.navigate(base_url + "/virtual.html")
+    await srv.scroll_to_load(max_scrolls=3, pause_ms=100)
+    links = json.loads(U(await srv.extract_links(pattern="/item/", limit=500)))
+    assert 0 < len(links) < 40
+
+
+async def test_scroll_collect_gets_every_row_of_a_virtual_list(srv, base_url):
+    await srv.navigate(base_url + "/virtual.html")
+    res = json.loads(U(await srv.scroll_collect("a.it", max_items=100, max_scrolls=60, pause_ms=100)))
+    urls = [i["url"] for i in res["items"]]
+    assert res["count"] == 100 and res["stopped"] == "max_items"
+    assert urls == [f"{base_url}/item/{i}" for i in range(100)]  # absolute, de-duplicated, in order
+    assert res["items"][7]["text"] == "Item 7"
+
+
+async def test_scroll_collect_stops_at_max_items_and_max_scrolls(srv, base_url):
+    await srv.navigate(base_url + "/virtual.html")
+    res = json.loads(U(await srv.scroll_collect("a.it", max_items=15, pause_ms=100)))
+    assert res["count"] == 15 and res["stopped"] == "max_items"
+    await srv.navigate(base_url + "/virtual.html")
+    res = json.loads(U(await srv.scroll_collect("a.it", max_items=100, max_scrolls=2, pause_ms=100)))
+    assert res["stopped"] == "max_scrolls" and res["scrolls"] == 2 and 15 < res["count"] < 100
+
+
+async def test_scroll_collect_stops_when_nothing_new_appears(srv, base_url):
+    await srv.navigate(base_url + "/index.html")
+    res = json.loads(U(await srv.scroll_collect("li.card", {"name": "h2", "price": ".price"}, idle_scrolls=2, pause_ms=100)))
+    assert res["count"] == 3 and res["stopped"] == "no new items"
+    assert res["items"][0] == {"name": "Alpha gummies", "price": "10,50 €"}
+
+
+async def test_scroll_collect_scrolls_an_inner_container(srv, base_url):
+    await srv.navigate(base_url + "/virtual_box.html")
+    res = json.loads(U(await srv.scroll_collect("a.it", container="#box", max_items=60, max_scrolls=60, pause_ms=100)))
+    assert res["count"] == 60 and [i["text"] for i in res["items"]] == [f"Row {i}" for i in range(60)]
+    bad = await srv.scroll_collect("a.it", container="#nope", max_scrolls=1, pause_ms=100)
+    assert bad.startswith("ERROR") and "not found" in bad
+
+
+async def test_scroll_collect_on_another_tab_and_validation(srv, base_url):
+    await srv.navigate(base_url + "/index.html")
+    cur = srv.S.cur
+    rows = json.loads(U(await srv.open_many([base_url + "/virtual.html"])))
+    tid = rows[0]["tab_id"]
+    try:
+        res = json.loads(U(await srv.scroll_collect("a.it", max_items=30, pause_ms=100, tab_id=tid)))
+        assert res["count"] == 30 and srv.S.cur == cur
+        assert (await srv.scroll_collect("")).startswith("ERROR")
+        assert (await srv.scroll_collect("a", max_items=0)).startswith("ERROR")
+        assert (await srv.scroll_collect("a", {"x": "@href"}, key="nope")).startswith("ERROR")
+    finally:
+        await _close(srv, tid)

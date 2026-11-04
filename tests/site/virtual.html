@@ -1,0 +1,16 @@
+<!doctype html><html><head><meta charset="utf-8"><title>Virtual</title>
+<style>body{margin:0}#list{position:relative;height:5000px}.it{position:absolute;left:0;height:40px;width:300px;display:block}</style></head><body>
+<div id="list"></div>
+<script>
+// 100 rows of 50px; only the rows near the viewport exist in the DOM (like Instagram's grid).
+const list = document.getElementById('list');
+function render() {
+  const first = Math.max(0, Math.floor(scrollY / 50) - 2), last = Math.min(99, Math.floor((scrollY + innerHeight) / 50) + 2);
+  list.innerHTML = '';
+  for (let i = first; i <= last; i++) {
+    const a = document.createElement('a'); a.className = 'it'; a.href = '/item/' + i; a.textContent = 'Item ' + i; a.style.top = (i * 50) + 'px';
+    list.appendChild(a);
+  }
+}
+addEventListener('scroll', render); render();
+</script></body></html>

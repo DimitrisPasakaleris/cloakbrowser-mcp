@@ -1,0 +1,15 @@
+<!doctype html><html><head><meta charset="utf-8"><title>Virtual box</title>
+<style>body{margin:0}#box{height:300px;overflow:auto;position:relative;border:1px solid #000}#inner{position:relative;height:3000px}.it{position:absolute;height:40px;width:200px;display:block}</style></head><body>
+<div id="box"><div id="inner"></div></div>
+<script>
+const box = document.getElementById('box'), inner = document.getElementById('inner');
+function render() {
+  const first = Math.max(0, Math.floor(box.scrollTop / 50) - 2), last = Math.min(59, Math.floor((box.scrollTop + box.clientHeight) / 50) + 2);
+  inner.innerHTML = '';
+  for (let i = first; i <= last; i++) {
+    const a = document.createElement('a'); a.className = 'it'; a.href = '/row/' + i; a.textContent = 'Row ' + i; a.style.top = (i * 50) + 'px';
+    inner.appendChild(a);
+  }
+}
+box.addEventListener('scroll', render); render();
+</script></body></html>

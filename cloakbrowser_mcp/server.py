@@ -518,7 +518,7 @@ TOOLSET_MEMBERS = {
     },
     "extract": {
         "get_html", "extract_links", "extract_structured", "extract_metadata", "extract_tables", "scroll_to_load",
-        "save_html", "save_pdf", "screenshot_file", "list_downloads", "download_file", "check_robots",
+        "scroll_collect", "save_html", "save_pdf", "screenshot_file", "list_downloads", "download_file", "check_robots",
     },
     "debug": {
         "console_logs", "list_network_requests", "get_response_body", "check_stealth", "stealth_audit", "fingerprint_info", "evaluate",
@@ -535,7 +535,7 @@ TOOLSET_MEMBERS = {
 # Tools that take an optional tab_id and then act on that tab instead of the current one (see _TAB).
 TAB_AWARE = {
     "screenshot", "screenshot_file", "snapshot", "get_text", "get_html", "get_markdown", "find_in_page",
-    "extract_links", "extract_structured", "extract_metadata", "extract_tables", "evaluate",
+    "extract_links", "extract_structured", "extract_metadata", "extract_tables", "evaluate", "scroll_collect",
 }
 ACT_TOOLS = {
     "run_steps", "click", "hover", "type_text", "fill_form", "press_key", "select_option", "upload_file", "evaluate",
@@ -903,6 +903,29 @@ JS_EXTRACT = """([sel, fields, limit]) => [...document.querySelectorAll(sel)].sl
   }
   return o;
 })"""
+
+# Like JS_EXTRACT, but href/src come back absolute (the page's own resolution), which is what you want from a gallery.
+JS_COLLECT = """([sel, fields, limit]) => [...document.querySelectorAll(sel)].slice(0, limit).map(it => {
+  const o = {};
+  for (const [k, spec] of Object.entries(fields)) {
+    const [css, attr] = spec.split('@');
+    const el = css ? it.querySelector(css) : it;
+    if (!el) { o[k] = null; continue; }
+    o[k] = attr ? ((attr === 'href' || attr === 'src') && el[attr] ? el[attr] : el.getAttribute(attr))
+                : (el.innerText || '').trim().replace(/\\s+/g, ' ');
+  }
+  return o;
+})"""
+
+# Scroll one step (a fraction of the viewport); report whether anything moved, so the caller can tell "at the bottom".
+JS_SCROLL_STEP = """([container, frac]) => {
+  const el = container ? document.querySelector(container) : null;
+  if (container && !el) return null;
+  const before = el ? el.scrollTop : window.scrollY;
+  if (el) el.scrollBy({top: Math.max(50, el.clientHeight * frac), behavior: 'instant'});
+  else window.scrollBy({top: Math.max(50, window.innerHeight * frac), behavior: 'instant'});
+  return (el ? el.scrollTop : window.scrollY) !== before;
+}"""
 
 JS_LINKS = """() => [...document.querySelectorAll('a[href]')].map(a => ({text: (a.innerText || a.getAttribute('aria-label') || '').trim().replace(/\\s+/g, ' ').slice(0, 120), href: a.href}))"""
 
@@ -1963,6 +1986,56 @@ async def scroll_to_load(max_scrolls: int = 10, pause_ms: int = 800) -> str:
         await page.evaluate("window.scrollTo(0,document.body.scrollHeight)")
         await page.wait_for_timeout(pause_ms)
     return f"scrolled {n} times; height={last}"
+
+
+@tool
+async def scroll_collect(
+    item_selector: str, fields: dict[str, str] | None = None, key: str = "", max_items: int = 60,
+    max_scrolls: int = 30, pause_ms: int = 700, idle_scrolls: int = 3, container: str = "", tab_id: int | None = None,
+) -> str:
+    """Scroll in steps and collect items as they appear, de-duplicated. Use it where scroll_to_load + extract_links lose
+    items because the page UNLOADS rows that scroll out of view (Instagram / Pinterest grids, virtual lists). fields is
+    as in extract_structured but href / src come back absolute; default {"url": "@href", "text": ""}. key = the field to
+    de-duplicate on (default: the first one). Stops at max_items, max_scrolls, or idle_scrolls steps with nothing new.
+    container='#css' scrolls that element instead of the page. Returns {count, scrolls, stopped, items}."""
+    if not item_selector:
+        raise ValueError("item_selector is required")
+    if not 1 <= max_items <= 500 or not 0 <= max_scrolls <= 200 or not 100 <= pause_ms <= 5000 or idle_scrolls < 1:
+        raise ValueError("max_items 1-500, max_scrolls 0-200, pause_ms 100-5000, idle_scrolls >= 1")
+    fields = fields or {"url": "@href", "text": ""}
+    key = key or next(iter(fields))
+    if key not in fields:
+        raise ValueError(f"key {key!r} is not one of the fields")
+    page = await _ensure()
+    seen: dict = {}
+    idle = scrolls = 0
+    stopped = "max_scrolls"
+    while True:
+        rows = await page.evaluate(JS_COLLECT, [item_selector, fields, 500])
+        new = 0
+        for r in rows:
+            k = r.get(key)
+            if k in (None, "") or k in seen:
+                continue
+            seen[k] = r
+            new += 1
+            if len(seen) >= max_items:
+                break
+        if len(seen) >= max_items:
+            stopped = "max_items"
+            break
+        idle = 0 if new else idle + 1
+        if idle >= idle_scrolls:
+            stopped = "no new items"
+            break
+        if scrolls >= max_scrolls:
+            break
+        moved = await page.evaluate(JS_SCROLL_STEP, [container, 0.8])
+        if moved is None:
+            raise ValueError(f"container {container!r} not found")
+        scrolls += 1
+        await page.wait_for_timeout(pause_ms)
+    return _untrusted(json.dumps({"count": len(seen), "scrolls": scrolls, "stopped": stopped, "items": list(seen.values())}, ensure_ascii=False))
 
 
 @tool
