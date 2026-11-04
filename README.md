@@ -2,7 +2,7 @@
 
 An [MCP](https://modelcontextprotocol.io) server that gives Claude (or any MCP client) a stealth browser. It wraps
 [CloakBrowser](https://github.com/CloakHQ/CloakBrowser), a patched Chromium that passes common bot checks, and exposes
-61 tools for navigation, reading, extraction, interaction, sessions, identity control, debugging and
+66 tools for navigation, reading, extraction, interaction, sessions, identity control, debugging and
 per-site memory that learns (on by default, local, one switch to turn off).
 
 ## Install
@@ -44,12 +44,37 @@ With `uv`: `claude mcp add cloakbrowser -s user -- uvx --from git+https://github
    product prices), `extract_tables`, `extract_structured`, `extract_links`.
 5. Prefer the JSON API behind a page: `list_network_requests(resource_type="xhr")`, then `get_response_body(i)`.
 
+## Many pages at once
+
+For comparing a set of pages (a gallery, search results, candidate posts) the cheap path is **text first, then one
+image**, instead of one screenshot per page:
+
+1. `scroll_collect(item_selector="a[href*='/p/']", max_items=60)` scrolls in steps and harvests as it goes, so it works
+   on pages that unload rows once they scroll away (Instagram and Pinterest grids, virtual lists), where `scroll_to_load`
+   followed by `extract_links` loses most items. Returns `{count, scrolls, stopped, items}`; `href`/`src` are absolute.
+2. `inspect_posts(urls=[...])` reads up to 12 post pages as text: author, likes, comments, views, date, location,
+   media (`image` | `carousel` | `video`), main image size in pixels, the platform's AI-generated label if the page
+   prints one, and the caption. Drop the AI-labelled, tiny and video posts without looking at them.
+3. `contact_sheet(tab_ids=[...], selector="article img")` shows many tabs as ONE labelled image (`inspect_posts(...,
+   keep_tabs=true)` or `open_many(urls)` gives you the tab ids). Judge those visually, then `tab_close` the rest.
+
+`open_many(urls)` opens up to 12 URLs in their own tabs, four loading at a time, and leaves the current tab alone.
+Read tools take an optional `tab_id` (`screenshot`, `snapshot`, `get_text`, `get_html`, `get_markdown`, `find_in_page`,
+`extract_links`, `extract_structured`, `extract_metadata`, `extract_tables`, `evaluate`, `screenshot_file`,
+`scroll_collect`) and act on that tab without switching to it; `0` or omitted means the current tab. Actions
+(`click`, `type_text`, ...) still act on the current tab.
+
+Limits worth knowing: `ai_label` is only as good as the label the page prints, so **no label is not proof a photo is
+real**; the post fields lean on `og:` tags and a few stable DOM signals, so another site may return nulls for some
+fields (it never errors for that); `retries` is not offered on `open_many` because a retry restarts the browser and
+would close every tab. These tools add about 900 tokens to the full tool list (`tab_id` alone adds 90 to `lean`).
+
 ## Keeping token use low
 
 Every tool *definition* is sent to the model on every turn, and every tool *result* adds to the conversation, so
 both are worth trimming. Measured on this repo (estimates, characters / 4):
 
-- **Tool definitions:** `CLOAK_TOOLS=lean` exposes 18 tools (about 2,000 tokens) instead of 58 (about 6,000).
+- **Tool definitions:** `CLOAK_TOOLS=lean` exposes 18 tools (about 2,200 tokens) instead of 58 (about 6,300).
   `standard` drops the debug group; `full` (default) has everything. Add single tools to `lean` with
   `CLOAK_EXTRA_TOOLS=configure,evaluate`. Memory tools stay out of the list until memory is switched on.
 - **Fewer round trips:** `read_url` = navigate + read; `run_steps` runs up to 25 click/type/fill/select/scroll/wait/goto
@@ -79,13 +104,14 @@ Toolsets can be selected with `CLOAK_TOOLSETS` (default: all five), or pick a wh
 
 | Toolset | Tools |
 |---|---|
-| `core` | `configure`, `close_browser`, `tabs_list`, `tab_new`, `tab_select`, `tab_close`, `navigate`, `read_url`, `run_steps`, `go_back`, `reload`, `wait_for`, `snapshot`, `get_text`, `get_markdown`, `find_in_page`, `screenshot` (optionally annotated with refs), `click`, `hover`, `type_text`, `fill_form`, `press_key`, `select_option`, `scroll` |
-| `extract` | `get_html`, `extract_links`, `extract_structured`, `extract_metadata`, `extract_tables`, `scroll_to_load`, `save_html`, `save_pdf`, `screenshot_file`, `download_file`, `list_downloads`, `check_robots` |
+| `core` | `configure`, `close_browser`, `tabs_list`, `tab_new`, `tab_select`, `tab_close`, `open_many`, `navigate`, `read_url`, `run_steps`, `go_back`, `reload`, `wait_for`, `snapshot`, `get_text`, `get_markdown`, `find_in_page`, `screenshot` (optionally annotated with refs), `contact_sheet`, `click`, `hover`, `type_text`, `fill_form`, `press_key`, `select_option`, `scroll` |
+| `extract` | `get_html`, `extract_links`, `extract_structured`, `extract_metadata`, `extract_tables`, `scroll_to_load`, `scroll_collect`, `inspect_posts`, `save_html`, `save_pdf`, `screenshot_file`, `download_file`, `list_downloads`, `check_robots` |
 | `debug` | `console_logs`, `list_network_requests`, `get_response_body`, `check_stealth`, `stealth_audit`, `fingerprint_info`, `evaluate` |
 | `memory` | `memory_request_access`, `memory_status`, `memory_recall`, `memory_remember`, `memory_disable`, `memory_forget`, `memory_audit`, `memory_export`, `memory_incognito` |
 | `session` | `rotate_proxy`, `new_identity`, `request_human`, `handle_dialog`, `upload_file`, `get_cookies`, `set_cookies`, `clear_cookies`, `save_session`, `load_session` |
 
-Read-only tools carry the MCP `readOnlyHint` annotation so clients can auto-approve them.
+Read-only tools (including `contact_sheet`) carry the MCP `readOnlyHint` annotation so clients can auto-approve them.
+`open_many`, `scroll_collect` and `inspect_posts` open or scroll pages, so they do not.
 
 `extract_structured` example, for product cards:
 
