@@ -270,3 +270,94 @@ async def test_scroll_collect_on_another_tab_and_validation(srv, base_url):
         assert (await srv.scroll_collect("a", {"x": "@href"}, key="nope")).startswith("ERROR")
     finally:
         await _close(srv, tid)
+
+
+# ---------------------------------------------------------------- inspect_posts
+async def test_count_parser_handles_the_formats_instagram_prints(srv):
+    c = srv._count
+    assert [c("12"), c("1,042"), c("1.042"), c("1.2K"), c("3M"), c("45k"), c("2.5 K")] == [12, 1042, 1042, 1200, 3_000_000, 45_000, 2500]
+    assert c("") is None and c(None) is None and c("lots") is None
+
+
+async def test_ai_label_matches_whole_label_lines_only(srv):
+    import re
+    rx = re.compile(srv.AI_LABEL_RX, re.I)
+    for yes in ("AI info", "AI-generated", "AI generated content", "Made with AI", "KI-Info", "Περιεχόμενο τεχνητής νοημοσύνης",
+                "Contenido de IA", "Contenu généré par IA"):
+        assert rx.match(yes), yes
+    for no in ("I love AI info sessions", "AI", "Paris AI-generated art tonight", "Tag your best photos", "Αρέσει σε 5 άτομα"):
+        assert not rx.match(no), no
+
+
+async def test_describe_post_parses_a_greek_locale_og_description(srv):
+    raw = {"ogDesc": '140 likes, 3 comments - america__states στις June 18, 2026: "Beautiful Louvre\nline two"',
+           "ogUrl": "https://www.instagram.com/america__states/p/DZwaAf7ty8I/", "path": "/p/DZwaAf7ty8I/",
+           "big": {"w": 810, "h": 1080, "src": "https://x/y.jpg"}, "aiLine": "Περιεχόμενο τεχνητής νοημοσύνης"}
+    d = srv._describe_post(raw, include_image_url=False)
+    assert (d["author"], d["likes"], d["comments"], d["views"]) == ("america__states", 140, 3, None)
+    assert d["caption"].startswith("Beautiful Louvre") and d["media"] == "image" and "image_url" not in d
+    assert d["main_image"] == {"w": 810, "h": 1080} and d["ai_label"] == "Περιεχόμενο τεχνητής νοημοσύνης"
+    assert srv._describe_post(raw, include_image_url=True)["image_url"] == "https://x/y.jpg"
+
+
+async def test_inspect_posts_reads_an_ai_labelled_carousel(srv, base_url):
+    await srv.navigate(base_url + "/index.html")
+    cur, before = srv.S.cur, set(srv.S.pages)
+    rows = json.loads(U(await srv.inspect_posts([base_url + "/post_ai.html"])))
+    r = rows[0]
+    assert (r["author"], r["likes"], r["comments"], r["views"]) == ("alice", 140, 3, None)
+    assert r["date"] == "2026-06-19T05:50:25.000Z" and r["location"] == "Paris, France"  # not the bare "Locations" nav link
+    assert r["media"] == "carousel" and r["main_image"] == {"w": 800, "h": 600}
+    assert r["ai_label"] == "Περιεχόμενο τεχνητής νοημοσύνης"
+    assert r["caption"] == "Louvre at dawn #paris" and r["login_wall"] is False and r["url"].endswith("/post_ai.html")
+    assert "tab_id" not in r and set(srv.S.pages) == before and srv.S.cur == cur  # temporary tab closed
+
+
+async def test_inspect_posts_plain_post_has_no_false_positives(srv, base_url):
+    r = json.loads(U(await srv.inspect_posts([base_url + "/post_plain.html"])))[0]
+    assert (r["author"], r["likes"], r["comments"]) == ("bob", 1042, 12)
+    assert r["ai_label"] is None  # the caption mentions "AI info" but is not the platform label
+    assert r["media"] == "image"  # the suggested-posts grid has its own Next arrow; it must not make this a carousel
+    assert r["location"] is None
+
+
+async def test_inspect_posts_video_and_views(srv, base_url):
+    r = json.loads(U(await srv.inspect_posts([base_url + "/post_video.html"])))[0]
+    assert r["media"] == "video" and r["views"] == 5210 and r["likes"] == 91 and r["author"] == "carol"
+
+
+async def test_inspect_posts_several_urls_in_order_with_a_refused_one(srv, base_url):
+    urls = [base_url + "/post_plain.html", "file:///c:/windows/win.ini", base_url + "/post_ai.html"]
+    rows = json.loads(U(await srv.inspect_posts(urls)))
+    assert [r.get("author") for r in rows] == ["bob", None, "alice"]
+    assert "error" in rows[1] and rows[1]["url"] == urls[1]
+
+
+async def test_inspect_posts_keep_tabs_feeds_contact_sheet(srv, base_url):
+    before = set(srv.S.pages)
+    rows = json.loads(U(await srv.inspect_posts([base_url + "/post_plain.html", base_url + "/post_ai.html"], keep_tabs=True, include_image_url=True)))
+    ids = [r["tab_id"] for r in rows]
+    try:
+        assert set(srv.S.pages) - before == set(ids) and rows[0]["image_url"].endswith("/photo.svg")
+        img = await srv.contact_sheet(ids, columns=2, cell_width=240, cell_height=200)
+        assert srv._image_size(img.data) == (2 * 240 + 4, 200)
+    finally:
+        await _close(srv, *ids)
+
+
+async def test_inspect_posts_on_tabs_that_are_already_open_leaves_them_open(srv, base_url):
+    opened = json.loads(U(await srv.open_many([base_url + "/post_ai.html"])))
+    tid = opened[0]["tab_id"]
+    try:
+        rows = json.loads(U(await srv.inspect_posts(tab_ids=[tid, 9999])))
+        assert rows[0]["author"] == "alice" and rows[0]["tab_id"] == tid and tid in srv.S.pages
+        assert rows[1]["tab_id"] == 9999 and rows[1]["error"] == "no such tab"
+    finally:
+        await _close(srv, tid)
+
+
+async def test_inspect_posts_non_post_page_and_validation(srv, base_url):
+    r = json.loads(U(await srv.inspect_posts([base_url + "/index.html"])))[0]
+    assert r["title"] == "Test Shop" and r["media"] is None and r["likes"] is None and r["ai_label"] is None
+    assert (await srv.inspect_posts()).startswith("ERROR")
+    assert (await srv.inspect_posts([base_url + "/index.html"] * (srv.MANY_MAX + 1))).startswith("ERROR")

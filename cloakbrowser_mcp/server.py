@@ -518,7 +518,7 @@ TOOLSET_MEMBERS = {
     },
     "extract": {
         "get_html", "extract_links", "extract_structured", "extract_metadata", "extract_tables", "scroll_to_load",
-        "scroll_collect", "save_html", "save_pdf", "screenshot_file", "list_downloads", "download_file", "check_robots",
+        "scroll_collect", "inspect_posts", "save_html", "save_pdf", "screenshot_file", "list_downloads", "download_file", "check_robots",
     },
     "debug": {
         "console_logs", "list_network_requests", "get_response_body", "check_stealth", "stealth_audit", "fingerprint_info", "evaluate",
@@ -719,7 +719,7 @@ def tool(fn):
                 want = sig.bind_partial(*a, **kw).arguments.get("tab_id")
             except TypeError:
                 want = None
-            if want is not None:
+            if want:  # 0 / None = the current tab
                 token = _TAB.set(int(want))
         try:
             res = await fn(*a, **kw)
@@ -925,6 +925,49 @@ JS_SCROLL_STEP = """([container, frac]) => {
   if (el) el.scrollBy({top: Math.max(50, el.clientHeight * frac), behavior: 'instant'});
   else window.scrollBy({top: Math.max(50, window.innerHeight * frac), behavior: 'instant'});
   return (el ? el.scrollTop : window.scrollY) !== before;
+}"""
+
+# Whole-line labels that platforms print on AI-generated posts ("AI info", Greek "Περιεχόμενο τεχνητής νοημοσύνης", ...).
+# Matched against short lines of the page text only, so a caption that merely mentions AI does not trigger it.
+AI_LABEL_RX = (
+    r"^(AI info|AI[- ]generated( content)?|Made with AI|Created with AI|Contenido (de|generado por) IA|Información de IA|"
+    r"Hecho con IA|Contenu (généré par )?IA|Infos? IA|Fait avec l.IA|KI-Inhalte|KI-Info|Mit KI erstellt|"
+    r"Contenuto (generato da )?IA|Info IA|Creato con l.IA|Conteúdo (de|gerado por) IA|Informações de IA|Feito com IA|"
+    r"Περιεχόμενο τεχνητής νοημοσύνης|Πληροφορίες τεχνητής νοημοσύνης|Δημιουργήθηκε με τεχνητή νοημοσύνη)$"
+)
+
+# What a post page says about itself. The main photo is the first LARGE image in document order (avatars are ~150px and
+# the "more posts" grid comes later); likes/comments/author/caption live in the og: tags, which survive hashed class names.
+JS_INSPECT = r"""([aiRx]) => {
+  const q = s => document.querySelector(s);
+  const meta = n => { const m = q('meta[property="' + n + '"]') || q('meta[name="' + n + '"]'); return m ? m.content : null; };
+  const rx = new RegExp(aiRx, 'i');
+  const lines = (document.body ? document.body.innerText : '').split('\n').map(l => l.trim()).filter(l => l && l.length <= 60);
+  const big = [...document.images].find(i => i.naturalWidth >= 400 && i.naturalHeight >= 300) || null;
+  const nextRx = /next|επόμενο|siguiente|suivant|weiter|avanti|próximo|следующ/i;
+  let carousel = false;
+  if (big) {
+    // The Next button is a few levels up (11 on instagram.com). Stop climbing once an ancestor holds many large images:
+    // that is the "more posts" grid, and its own carousels' arrows must not count for this post.
+    let el = big.parentElement;
+    for (let d = 0; el && d < 14 && !carousel; d++, el = el.parentElement) {
+      if ([...el.querySelectorAll('img')].filter(i => i.naturalWidth >= 400).length > 4) break;
+      carousel = [...el.querySelectorAll('button[aria-label],[role=button][aria-label]')].some(b => nextRx.test(b.getAttribute('aria-label') || ''));
+    }
+  }
+  const t = q('time[datetime]');
+  const loc = [...document.querySelectorAll('a[href*="/explore/locations/"]')].find(a => /locations\/\d+/.test(a.getAttribute('href') || ''));
+  return {
+    url: location.href, path: location.pathname, title: document.title,
+    ogTitle: meta('og:title'), ogDesc: meta('og:description') || meta('description'), ogUrl: meta('og:url'),
+    ogType: meta('og:type'), ogImage: meta('og:image'), ogVideo: meta('og:video'),
+    date: t ? t.getAttribute('datetime') : null,
+    location: loc ? (loc.innerText || '').trim() : null,
+    hasVideo: document.querySelectorAll('video').length > 0,
+    big: big ? {w: big.naturalWidth, h: big.naturalHeight, src: big.currentSrc || big.src} : null,
+    carousel: carousel,
+    aiLine: lines.find(l => rx.test(l)) || null,
+  };
 }"""
 
 JS_LINKS = """() => [...document.querySelectorAll('a[href]')].map(a => ({text: (a.innerText || a.getAttribute('aria-label') || '').trim().replace(/\\s+/g, ' ').slice(0, 120), href: a.href}))"""
@@ -1208,9 +1251,7 @@ async def _open_tabs(urls: list[str], parallel: int, settle_ms: int | None) -> l
 
 @tool
 async def open_many(urls: list[str], parallel: int = MANY_PARALLEL, settle_ms: int | None = None) -> str:
-    """Open up to 12 URLs, each in its own new tab, loading `parallel` (default 4, max 8) at a time. Returns JSON
-    [{tab_id, url, status, title, blocked?, error?}]; the current tab does not change. Then read any of them with
-    tab_id= (get_markdown, screenshot, ...), see them all in ONE image with contact_sheet, and close with tab_close."""
+    """Open up to 12 URLs, each in its own new tab (4 load at once). Returns JSON [{tab_id, url, status, title, blocked?, error?}]; the current tab is unchanged. Then read tabs with tab_id=, compare them with contact_sheet, close with tab_close."""
     return _untrusted(json.dumps(await _open_tabs(urls, parallel, settle_ms), ensure_ascii=False))
 
 
@@ -1503,7 +1544,7 @@ SNAP_DEFAULT_ITEMS = 80
 
 @tool
 async def snapshot(
-    max_items: int = SNAP_DEFAULT_ITEMS, scope: str = "", diff: bool | None = None, tab_id: int | None = None
+    max_items: int = SNAP_DEFAULT_ITEMS, scope: str = "", diff: bool | None = None, tab_id: int = 0
 ) -> str:
     """List clickable/typeable elements as [ref] tag "label" (use the ref e12 as selector in click/type_text;
     f2e5 = inside iframe #2). Refs stay stable while the page is loaded. scope='#css' limits it to one
@@ -1574,7 +1615,7 @@ async def _page_markdown(page, selector: str, main_only: bool, links: str) -> st
 
 @tool
 async def get_text(
-    selector: str = "body", max_chars: int = DEFAULT_CHARS, offset: int = 0, tab_id: int | None = None
+    selector: str = "body", max_chars: int = DEFAULT_CHARS, offset: int = 0, tab_id: int = 0
 ) -> str:
     """Visible text of an element (default whole page), wrapped as untrusted page content. Long text is
     paged: pass offset=N from the 'call again with offset' note to continue."""
@@ -1583,7 +1624,7 @@ async def get_text(
 
 
 @tool
-async def get_html(selector: str = "body", max_chars: int = 8000, offset: int = 0, tab_id: int | None = None) -> str:
+async def get_html(selector: str = "body", max_chars: int = 8000, offset: int = 0, tab_id: int = 0) -> str:
     """Outer HTML of an element (untrusted page content). Prefer get_markdown; use this for markup details."""
     page = await _ensure()
     html = await _loc(page, selector).evaluate("e => e.outerHTML")
@@ -1593,7 +1634,7 @@ async def get_html(selector: str = "body", max_chars: int = 8000, offset: int = 
 @tool
 async def get_markdown(
     selector: str = "body", max_chars: int = DEFAULT_CHARS, offset: int = 0, main_only: bool = True, links: str = "keep",
-    tab_id: int | None = None,
+    tab_id: int = 0,
 ) -> str:
     """Page (or element) as compact markdown (untrusted page content). main_only drops menus, footers and
     cookie banners. links: keep | short (no query strings) | none (text only, cheapest). Long pages are
@@ -1604,7 +1645,7 @@ async def get_markdown(
 
 @tool
 async def find_in_page(
-    query: str, context: int = 160, max_matches: int = 8, regex: bool = False, tab_id: int | None = None
+    query: str, context: int = 160, max_matches: int = 8, regex: bool = False, tab_id: int = 0
 ) -> str:
     """Search the page text and return only the matching snippets (with surrounding context and the char
     offset in get_text), far cheaper than reading the whole page. Case-insensitive."""
@@ -1633,7 +1674,7 @@ async def find_in_page(
 
 
 @tool
-async def extract_links(pattern: str = "", limit: int = 100, unique: bool = True, tab_id: int | None = None) -> str:
+async def extract_links(pattern: str = "", limit: int = 100, unique: bool = True, tab_id: int = 0) -> str:
     """All links on the page as JSON [{text, href}]. `pattern` is a regex matched on href or text."""
     page = await _ensure()
     links = await page.evaluate(JS_LINKS)
@@ -1652,7 +1693,7 @@ async def extract_links(pattern: str = "", limit: int = 100, unique: bool = True
 
 @tool
 async def extract_structured(
-    item_selector: str, fields: dict[str, str], limit: int = 50, tab_id: int | None = None
+    item_selector: str, fields: dict[str, str], limit: int = 50, tab_id: int = 0
 ) -> str:
     """Extract repeated items (e.g. product cards) as JSON. fields maps name -> 'css' (inner text),
     'css@attr' (attribute) or '@attr' (attribute of the item itself). Example:
@@ -1682,7 +1723,7 @@ def _shot_fmt(fmt: str) -> str:
 @tool
 async def screenshot(
     selector: str = "", full_page: bool = False, annotate: bool = False, format: str = "", quality: int = 0,
-    max_width: int = -1, tab_id: int | None = None,
+    max_width: int = -1, tab_id: int = 0,
 ) -> Image:
     """Screenshot of the page or one element. Images are expensive: prefer snapshot / get_markdown /
     find_in_page and use this only when layout matters. Scaled to 1024px wide (max_width=0 for full size)
@@ -1752,7 +1793,7 @@ async def _shot(
 @tool
 async def screenshot_file(
     filename: str = "shot.jpg", selector: str = "", full_page: bool = False, annotate: bool = False,
-    format: str = "", quality: int = 0, max_width: int = 0, tab_id: int | None = None,
+    format: str = "", quality: int = 0, max_width: int = 0, tab_id: int = 0,
 ) -> str:
     """Like screenshot but saves the image into the output dir at full size (unless max_width is set) and
     returns the path, so no image enters the context. The format follows the extension (.png | .jpg)."""
@@ -1787,10 +1828,7 @@ async def contact_sheet(
     tab_ids: list[int] | None = None, selector: str = "", columns: int = 3, cell_width: int = 360,
     cell_height: int = 360, quality: int = 0,
 ) -> Image:
-    """ONE image showing up to 12 tabs side by side (each cell labelled "#tab_id host"), so you can compare many
-    pages for the price of one screenshot. tab_ids default: every open tab. selector (e.g. 'article img') shoots just
-    that element in each tab. Cells are cell_width x cell_height; columns x cell_width must be <= 2400. Pair with
-    open_many; a tab that fails shows an error cell instead of breaking the sheet."""
+    """ONE image of up to 12 tabs (default: all), each cell labelled '#tab_id host'. selector (e.g. 'article img') shoots just that element per tab. columns x cell_width <= 2400. A failed tab shows an error cell."""
     if not 1 <= columns <= 6 or not 120 <= cell_width <= 800 or not 120 <= cell_height <= 800:
         raise ValueError("columns must be 1-6 and cell_width / cell_height 120-800")
     if columns * cell_width > 2400:
@@ -1991,13 +2029,9 @@ async def scroll_to_load(max_scrolls: int = 10, pause_ms: int = 800) -> str:
 @tool
 async def scroll_collect(
     item_selector: str, fields: dict[str, str] | None = None, key: str = "", max_items: int = 60,
-    max_scrolls: int = 30, pause_ms: int = 700, idle_scrolls: int = 3, container: str = "", tab_id: int | None = None,
+    max_scrolls: int = 30, pause_ms: int = 700, idle_scrolls: int = 3, container: str = "", tab_id: int = 0,
 ) -> str:
-    """Scroll in steps and collect items as they appear, de-duplicated. Use it where scroll_to_load + extract_links lose
-    items because the page UNLOADS rows that scroll out of view (Instagram / Pinterest grids, virtual lists). fields is
-    as in extract_structured but href / src come back absolute; default {"url": "@href", "text": ""}. key = the field to
-    de-duplicate on (default: the first one). Stops at max_items, max_scrolls, or idle_scrolls steps with nothing new.
-    container='#css' scrolls that element instead of the page. Returns {count, scrolls, stopped, items}."""
+    """Scroll in steps and collect items as they appear, de-duplicated. For pages that unload off-screen rows (Instagram grids, virtual lists), where scroll_to_load + extract_links lose items. fields as in extract_structured (href/src absolute; default url + text); key = field to de-duplicate on. Stops at max_items, max_scrolls, or idle_scrolls steps with nothing new. container='#css' scrolls that element. Returns {count, scrolls, stopped, items}."""
     if not item_selector:
         raise ValueError("item_selector is required")
     if not 1 <= max_items <= 500 or not 0 <= max_scrolls <= 200 or not 100 <= pause_ms <= 5000 or idle_scrolls < 1:
@@ -2038,6 +2072,111 @@ async def scroll_collect(
     return _untrusted(json.dumps({"count": len(seen), "scrolls": scrolls, "stopped": stopped, "items": list(seen.values())}, ensure_ascii=False))
 
 
+def _count(text: str | None) -> int | None:
+    """'1,042' -> 1042, '1.2K' -> 1200, '3M' -> 3000000, '1.042' (thousands dot) -> 1042; None if unreadable."""
+    if not text:
+        return None
+    t = text.strip().replace(" ", "")
+    if re.fullmatch(r"\d{1,3}([.,]\d{3})+", t):
+        return int(re.sub(r"[.,]", "", t))
+    m = re.fullmatch(r"(\d+(?:[.,]\d+)?)([KkMm]?)", t)
+    if not m:
+        return None
+    return int(round(float(m.group(1).replace(",", ".")) * {"": 1, "k": 1_000, "m": 1_000_000}[m.group(2).lower()]))
+
+
+def _describe_post(raw: dict, include_image_url: bool) -> dict:
+    """Turn the JS_INSPECT result into the compact record inspect_posts returns."""
+    desc = raw.get("ogDesc") or ""
+    head, sep, rest = desc.partition(': "')
+    caption = rest.rstrip().removesuffix('"') if sep else desc
+    stats = head if sep else ""
+    num = r"(\d[\d.,]*\s?[KkMm]?)"
+    grab = lambda word: (re.search(num + r"\s+" + word, stats) or [None, None])[1]
+    author = None
+    if m := re.search(r"instagram\.com/([^/]+)/(?:p|reel|tv)/", raw.get("ogUrl") or ""):
+        author = m.group(1)
+    elif m := re.search(r"-\s*(\S+)", stats):
+        author = m.group(1)
+    video = raw.get("hasVideo") or bool(raw.get("ogVideo")) or "/reel/" in (raw.get("path") or "")
+    big = raw.get("big")
+    out = {
+        "title": (raw.get("ogTitle") or raw.get("title") or "")[:120],
+        "author": author,
+        "likes": _count(grab(r"likes?")),
+        "comments": _count(grab(r"comments?")),
+        "views": _count(grab(r"(?:views?|plays?)")),
+        "date": raw.get("date"),
+        "location": raw.get("location"),
+        "media": "video" if video else "carousel" if raw.get("carousel") else "image" if (big or raw.get("ogImage")) else None,
+        "main_image": {"w": big["w"], "h": big["h"]} if big else None,
+        "ai_label": raw.get("aiLine"),
+        "login_wall": (raw.get("path") or "").startswith("/accounts/login"),
+        "caption": caption.strip()[:300] or None,
+    }
+    if include_image_url:
+        out["image_url"] = (big or {}).get("src") or raw.get("ogImage")
+    return out
+
+
+@tool
+async def inspect_posts(
+    urls: list[str] | None = None, tab_ids: list[int] | None = None, keep_tabs: bool = False,
+    include_image_url: bool = False, parallel: int = MANY_PARALLEL,
+) -> str:
+    """Read up to 12 post pages as TEXT, so you only look at borderline ones: author, likes, comments, views, date, location, media (image|carousel|video), main_image {w,h}, ai_label (the platform's AI-generated label if printed; absence is not proof), login_wall, caption. urls open in temporary tabs (keep_tabs=true keeps them and returns tab_ids for contact_sheet); tab_ids inspects tabs already open."""
+    if not urls and not tab_ids:
+        raise ValueError("give urls or tab_ids")
+    if len(urls or []) + len(tab_ids or []) > MANY_MAX:
+        raise ValueError(f"at most {MANY_MAX} posts per call")
+    entries: list[dict] = []  # in the order given: tab_ids first, then urls
+    for tid in tab_ids or []:
+        entries.append({"tab_id": tid, "opened": False})
+    if urls:
+        for r in await _open_tabs(urls, parallel, None):
+            entries.append({**r, "opened": True})
+    sem = asyncio.Semaphore(max(1, min(parallel, 8)))
+
+    async def one(e):
+        pid = e.get("tab_id")
+        if pid is None or "error" in e:  # refused URL or failed navigation: report as is
+            return
+        page = S.pages.get(pid)
+        if page is None or page.is_closed():
+            e["error"] = "no such tab"
+            return
+        async with sem:
+            try:
+                await page.wait_for_function(
+                    "() => !document.querySelector('meta[property=\"og:image\"]') || "
+                    "[...document.images].some(i => i.complete && i.naturalWidth >= 400)", timeout=4000)
+            except Exception:
+                pass  # no large image (yet): inspect what is there
+            try:
+                raw = await page.evaluate(JS_INSPECT, [AI_LABEL_RX])
+                e.update(_describe_post(raw, include_image_url))
+                e["url"] = raw.get("url") or e.get("url")
+            except Exception as ex:
+                e["error"] = f"{type(ex).__name__}"
+
+    await asyncio.gather(*(one(e) for e in entries))
+    out = []
+    for e in entries:
+        opened = e.pop("opened")
+        pid = e.get("tab_id")
+        if opened and pid is not None and not keep_tabs:
+            p = S.pages.get(pid)
+            if p is not None and not p.is_closed():
+                await p.close()
+            S.pages.pop(pid, None)
+            e.pop("tab_id")
+        out.append(e)
+    live = [i for i in S.pages if not S.pages[i].is_closed()]
+    if S.cur not in S.pages or S.pages[S.cur].is_closed():
+        S.cur = live[-1] if live else None
+    return _untrusted(json.dumps(out, ensure_ascii=False))
+
+
 @tool
 async def upload_file(selector: str, path: str) -> str:
     """Attach a local file to an <input type=file>."""
@@ -2056,7 +2195,7 @@ async def handle_dialog(action: str = "accept") -> str:
 
 
 @tool
-async def evaluate(script: str, tab_id: int | None = None) -> str:
+async def evaluate(script: str, tab_id: int = 0) -> str:
     """Run a JS expression or arrow function in the page; result returned as JSON (wrapped as
     untrusted page content). Disabled when CLOAK_ALLOW_EVAL=0."""
     if not POLICY["allow_eval"]:
@@ -2274,7 +2413,7 @@ def _walk_ld(node, found):
 
 
 @tool
-async def extract_metadata(max_chars: int = 8000, offset: int = 0, tab_id: int | None = None) -> str:
+async def extract_metadata(max_chars: int = 8000, offset: int = 0, tab_id: int = 0) -> str:
     """Structured data embedded in the page: JSON-LD, OpenGraph, microdata and common meta tags, plus a
     'products' summary (name, brand, offers with price/currency/availability) built from schema.org
     Product data. Often more reliable and cheaper than scraping with CSS selectors on shops."""
@@ -2287,7 +2426,7 @@ async def extract_metadata(max_chars: int = 8000, offset: int = 0, tab_id: int |
 
 
 @tool
-async def extract_tables(max_tables: int = 10, max_rows: int = 50, tab_id: int | None = None) -> str:
+async def extract_tables(max_tables: int = 10, max_rows: int = 50, tab_id: int = 0) -> str:
     """HTML tables as JSON: [{caption, headers, rows}]."""
     page = await _ensure()
     tables = await page.evaluate(JS_TABLES, [max_tables, max_rows])
