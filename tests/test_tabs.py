@@ -2,6 +2,7 @@
 import asyncio
 import inspect
 import json
+import time
 
 import pytest
 from helpers import U
@@ -142,3 +143,73 @@ async def test_open_many_twelve_tabs_in_parallel(srv, base_url):
         assert [r["url"].rsplit("=", 1)[1] for r in rows] == [str(i) for i in range(12)]
     finally:
         await _close(srv, *[r["tab_id"] for r in rows])
+
+
+# ---------------------------------------------------------------- contact_sheet
+async def _pixels(srv, img, points):
+    """RGB at each (x, y) of a JPEG returned by a tool, decoded by the browser itself (no imaging library needed)."""
+    import base64
+    b64 = base64.b64encode(img.data).decode()
+    script = (
+        "async () => { const im = new Image(); im.src = 'data:image/jpeg;base64," + b64 + "'; await im.decode();"
+        "const c = document.createElement('canvas'); c.width = im.width; c.height = im.height;"
+        "const x = c.getContext('2d'); x.drawImage(im, 0, 0);"
+        f"return {json.dumps(points)}.map(([a, b]) => Array.from(x.getImageData(a, b, 1, 1).data).slice(0, 3)); }}"
+    )
+    return json.loads(U(await srv.evaluate(script)))
+
+
+def _is(rgb, want, tol=45):
+    return all(abs(a - b) <= tol for a, b in zip(rgb, want))
+
+
+RED, GREEN, BLUE, WHITE = (224, 0, 0), (0, 160, 0), (0, 0, 224), (255, 255, 255)
+
+
+async def test_contact_sheet_puts_each_tab_in_its_own_cell(srv, base_url):
+    await srv.navigate(base_url + "/index.html")
+    cur, before = srv.S.cur, set(srv.S.pages)
+    rows = json.loads(U(await srv.open_many([base_url + p for p in ("/red.html", "/green.html", "/blue.html", "/boxed.html")])))
+    ids = [r["tab_id"] for r in rows]
+    try:
+        img = await srv.contact_sheet(ids, columns=2, cell_width=300, cell_height=200)
+        assert srv._image_size(img.data) == (2 * 300 + 4, 2 * 200 + 4)
+        centre = lambda c, r: (c * 304 + 150, r * 204 + 100)
+        got = await _pixels(srv, img, [centre(0, 0), centre(1, 0), centre(0, 1), centre(1, 1)])
+        assert _is(got[0], RED) and _is(got[1], GREEN) and _is(got[2], BLUE), got
+        assert _is(got[3], WHITE), got  # the boxed page is white where its red box does not reach
+    finally:
+        await _close(srv, *ids)
+    assert srv.S.cur == cur and set(srv.S.pages) == before  # the scratch tab is gone, the current tab unchanged
+
+
+async def test_contact_sheet_selector_shoots_just_that_element(srv, base_url):
+    rows = json.loads(U(await srv.open_many([base_url + "/boxed.html"])))
+    ids = [r["tab_id"] for r in rows]
+    try:
+        img = await srv.contact_sheet(ids, selector="#box", columns=1, cell_width=300, cell_height=200)
+        assert _is((await _pixels(srv, img, [(150, 100)]))[0], RED)
+    finally:
+        await _close(srv, *ids)
+
+
+async def test_contact_sheet_a_bad_tab_or_selector_gets_an_error_cell(srv, base_url):
+    rows = json.loads(U(await srv.open_many([base_url + "/red.html"])))
+    ids = [r["tab_id"] for r in rows]
+    try:
+        img = await srv.contact_sheet([ids[0], 9999], columns=2, cell_width=300, cell_height=200)
+        got = await _pixels(srv, img, [(150, 100), (304 + 6, 6)])
+        assert _is(got[0], RED)
+        assert all(v < 70 for v in got[1]), got  # dark error cell, not a crash
+        t0 = time.monotonic()
+        img = await srv.contact_sheet(ids, selector="#does-not-exist", columns=1, cell_width=300, cell_height=200)
+        assert srv._image_size(img.data) == (300, 200)
+        assert time.monotonic() - t0 < 8  # a missing selector fails fast, it does not wait out locator timeouts
+    finally:
+        await _close(srv, *ids)
+
+
+async def test_contact_sheet_validates_input(srv, base_url):
+    assert "ERROR" in str(await srv.contact_sheet(columns=0))
+    assert "ERROR" in str(await srv.contact_sheet(columns=6, cell_width=500))
+    assert "ERROR" in str(await srv.contact_sheet(list(range(1, srv.MANY_MAX + 2))))

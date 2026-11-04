@@ -19,6 +19,7 @@ import asyncio
 import base64
 import contextvars
 import functools
+import html as htmllib
 import inspect
 import json
 import logging
@@ -513,7 +514,7 @@ TOOLSET_MEMBERS = {
     "core": {
         "configure", "close_browser", "tabs_list", "tab_new", "tab_select", "tab_close", "open_many", "navigate", "go_back",
         "reload", "wait_for", "snapshot", "get_text", "get_markdown", "find_in_page", "read_url", "run_steps",
-        "screenshot", "click", "hover", "type_text", "fill_form", "press_key", "select_option", "scroll",
+        "screenshot", "contact_sheet", "click", "hover", "type_text", "fill_form", "press_key", "select_option", "scroll",
     },
     "extract": {
         "get_html", "extract_links", "extract_structured", "extract_metadata", "extract_tables", "scroll_to_load",
@@ -542,7 +543,7 @@ ACT_TOOLS = {
 }
 READ_ONLY_TOOLS = {
     "tabs_list", "snapshot", "find_in_page", "get_text", "get_html", "get_markdown", "extract_links", "extract_structured",
-    "extract_metadata", "extract_tables", "screenshot", "screenshot_file", "list_downloads", "check_robots",
+    "extract_metadata", "extract_tables", "screenshot", "screenshot_file", "contact_sheet", "list_downloads", "check_robots",
     "console_logs", "list_network_requests", "get_response_body", "check_stealth", "stealth_audit", "fingerprint_info", "get_cookies",
     "save_html", "save_pdf", "memory_status", "memory_audit", "memory_recall",
 }
@@ -1738,6 +1739,95 @@ async def screenshot_file(
     path = OUT_DIR / Path(filename).name
     path.write_bytes(data)
     return str(path)
+
+
+SHEET_GAP = 4  # px between cells
+
+
+async def _capture_tab(pid: int, selector: str, width: int, quality: int) -> tuple[bytes | None, str]:
+    """JPEG of one tab scaled to `width` css px, or (None, why). Runs in its own task, so it may set _TAB freely."""
+    token = _TAB.set(pid)
+    try:
+        if selector and await _loc(await _ensure(), selector).count() == 0:
+            return None, "no match"  # fail fast instead of waiting out two 15 s locator timeouts
+        return await asyncio.wait_for(_shot(selector, False, False, "jpeg", quality, width), timeout=25), ""
+    except asyncio.TimeoutError:
+        return None, "timed out"
+    except Exception as e:
+        return None, type(e).__name__
+    finally:
+        _TAB.reset(token)
+
+
+@tool
+async def contact_sheet(
+    tab_ids: list[int] | None = None, selector: str = "", columns: int = 3, cell_width: int = 360,
+    cell_height: int = 360, quality: int = 0,
+) -> Image:
+    """ONE image showing up to 12 tabs side by side (each cell labelled "#tab_id host"), so you can compare many
+    pages for the price of one screenshot. tab_ids default: every open tab. selector (e.g. 'article img') shoots just
+    that element in each tab. Cells are cell_width x cell_height; columns x cell_width must be <= 2400. Pair with
+    open_many; a tab that fails shows an error cell instead of breaking the sheet."""
+    if not 1 <= columns <= 6 or not 120 <= cell_width <= 800 or not 120 <= cell_height <= 800:
+        raise ValueError("columns must be 1-6 and cell_width / cell_height 120-800")
+    if columns * cell_width > 2400:
+        raise ValueError("columns x cell_width must be <= 2400")
+    await _ensure()
+    ids = list(tab_ids) if tab_ids else sorted(i for i, p in S.pages.items() if not p.is_closed())
+    if not ids:
+        raise ValueError("no tabs to show")
+    if len(ids) > MANY_MAX:
+        raise ValueError(f"at most {MANY_MAX} tabs per sheet (got {len(ids)})")
+    quality = min(100, max(1, quality or SHOT_QUALITY))
+    sem = asyncio.Semaphore(MANY_PARALLEL)
+
+    async def cell(pid):
+        page = S.pages.get(pid)
+        if page is None or page.is_closed():
+            return None, "no such tab"
+        async with sem:
+            return await _capture_tab(pid, selector, cell_width, quality)
+
+    shots = await asyncio.gather(*(cell(i) for i in ids))
+    figs = []
+    for pid, (data, why) in zip(ids, shots):
+        page = S.pages.get(pid)
+        host = urllib.parse.urlparse(page.url).hostname or "" if page is not None and not page.is_closed() else ""
+        label = htmllib.escape(f"#{pid} {host}".strip())
+        if data:
+            src = "data:image/jpeg;base64," + base64.b64encode(data).decode()
+            figs.append(f'<figure><img src="{src}"><figcaption>{label}</figcaption></figure>')
+        else:
+            figs.append(f'<figure class="err">#{pid}: {htmllib.escape(why or "failed")}</figure>')
+    rows = -(-len(ids) // columns)
+    width = columns * cell_width + (columns - 1) * SHEET_GAP
+    height = rows * cell_height + (rows - 1) * SHEET_GAP
+    doc = (
+        "<head><meta charset=utf-8><style>"
+        "html,body{margin:0;background:#000}"
+        f"body{{display:grid;grid-template-columns:repeat({columns},{cell_width}px);grid-auto-rows:{cell_height}px;gap:{SHEET_GAP}px}}"
+        f"figure{{margin:0;position:relative;background:#161616;overflow:hidden;width:{cell_width}px;height:{cell_height}px}}"
+        "img{width:100%;height:100%;object-fit:contain;display:block}"
+        "figcaption{position:absolute;left:4px;bottom:4px;font:600 13px/1 system-ui,sans-serif;color:#fff;"
+        f"background:rgba(0,0,0,.72);padding:3px 6px;border-radius:3px;max-width:{cell_width - 20}px;white-space:nowrap;"
+        "overflow:hidden;text-overflow:ellipsis}"
+        "figure.err{display:flex;align-items:center;justify-content:center;color:#f88;font:14px system-ui,sans-serif}"
+        "</style></head><body>" + "".join(figs) + "</body>"
+    )
+    sid = await _new_tab()  # scratch tab: the grid is rendered by the browser itself, so no imaging library is needed
+    page = S.pages[sid]
+    try:
+        await page.set_viewport_size({"width": width, "height": height})
+        # not page.set_content: on a fresh blank tab it never settles on this Chromium build
+        await page.evaluate("html => { document.documentElement.innerHTML = html; }", doc)
+        await page.evaluate("() => Promise.all([...document.images].map(i => i.decode().catch(() => 0)))")
+        data = await page.screenshot(type="jpeg", quality=quality)
+    finally:
+        try:
+            await page.close()
+        finally:
+            S.pages.pop(sid, None)
+    return Image(data=data, format="jpeg")
 
 
 @tool
