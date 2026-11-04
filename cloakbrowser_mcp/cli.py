@@ -17,6 +17,9 @@ def main():
 
         print(__version__)
         return
+    from .updater import maybe_update
+
+    maybe_update()  # pull the latest GitHub commit before the server code is imported
     from .server import main as run_server
 
     run_server()

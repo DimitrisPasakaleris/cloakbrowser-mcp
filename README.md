@@ -271,3 +271,7 @@ python e2e_learning.py    # default-on memory: notice, learned pop-ups / load st
 python e2e_savings.py     # lean profile, read_url/run_steps, scaled screenshots, usage log, opt-in memory tools
 python bench_tokens.py URL...   # before/after token estimates on real pages
 ```
+
+## Auto-update
+
+On startup (at most every 6 h) a git checkout fast-forwards to the latest `origin` commit and refreshes deps if `pyproject.toml` changed. It skips a dirty tree or unpushed local commits. Disable with `CLOAKBROWSER_MCP_AUTOUPDATE=0`; change the interval with `CLOAKBROWSER_MCP_UPDATE_INTERVAL_S`.
