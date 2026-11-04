@@ -17,7 +17,9 @@ Memory (off unless the user opts in; see README):
 """
 import asyncio
 import base64
+import contextvars
 import functools
+import inspect
 import json
 import logging
 import os
@@ -141,6 +143,17 @@ class State:
 
 
 S = State()
+# Which tab the running tool call targets. A ContextVar is task-local, so two calls that name different tabs can run
+# at the same time without either one switching the shared "current tab" (S.cur).
+_TAB: contextvars.ContextVar = contextvars.ContextVar("cloak_tab", default=None)
+
+
+def _cur_id():
+    """Id of the tab this call acts on: its tab_id argument if it has one, else the current tab."""
+    t = _TAB.get()
+    return S.cur if t is None else t
+
+
 MAX_NET = 400
 DEFAULT_CHARS = 6000  # ~1.5k tokens per read; page with offset=, or search with find_in_page
 LEARNED_TEXT_CHARS = 1500  # page text kept next to the items when a learned extractor recipe is used (see read_url)
@@ -487,12 +500,18 @@ async def _ensure():
             else:
                 await S.ctx.new_page()  # 'page' event registers it
                 await asyncio.sleep(0)
+        want = _TAB.get()
+        if want is not None:  # this call named a tab (tab_id=...): act on it without changing the current one
+            page = S.pages.get(want)
+            if page is None or page.is_closed():
+                raise ValueError(f"no such tab {want} (see tabs_list)")
+            return page
         return S.pages[S.cur]
 
 
 TOOLSET_MEMBERS = {
     "core": {
-        "configure", "close_browser", "tabs_list", "tab_new", "tab_select", "tab_close", "navigate", "go_back",
+        "configure", "close_browser", "tabs_list", "tab_new", "tab_select", "tab_close", "open_many", "navigate", "go_back",
         "reload", "wait_for", "snapshot", "get_text", "get_markdown", "find_in_page", "read_url", "run_steps",
         "screenshot", "click", "hover", "type_text", "fill_form", "press_key", "select_option", "scroll",
     },
@@ -511,6 +530,11 @@ TOOLSET_MEMBERS = {
         "rotate_proxy", "new_identity", "request_human", "handle_dialog", "upload_file", "get_cookies",
         "set_cookies", "clear_cookies", "save_session", "load_session",
     },
+}
+# Tools that take an optional tab_id and then act on that tab instead of the current one (see _TAB).
+TAB_AWARE = {
+    "screenshot", "screenshot_file", "snapshot", "get_text", "get_html", "get_markdown", "find_in_page",
+    "extract_links", "extract_structured", "extract_metadata", "extract_tables", "evaluate",
 }
 ACT_TOOLS = {
     "run_steps", "click", "hover", "type_text", "fill_form", "press_key", "select_option", "upload_file", "evaluate",
@@ -680,10 +704,22 @@ def _record_usage(name: str, res, ms: int, err: bool) -> None:
 def tool(fn):
     """Register an MCP tool; turn exceptions into short error strings, log them and record the result size."""
     name = fn.__name__
+    sig = inspect.signature(fn)
+    tab_aware = name in TAB_AWARE
+    if tab_aware and "tab_id" not in sig.parameters:
+        raise RuntimeError(f"{name} is in TAB_AWARE but has no tab_id parameter")
 
     @functools.wraps(fn)
     async def wrapper(*a, **kw):
         t0 = time.monotonic()
+        token = None
+        if tab_aware:
+            try:
+                want = sig.bind_partial(*a, **kw).arguments.get("tab_id")
+            except TypeError:
+                want = None
+            if want is not None:
+                token = _TAB.set(int(want))
         try:
             res = await fn(*a, **kw)
             err = isinstance(res, str) and res.startswith("ERROR")
@@ -691,6 +727,9 @@ def tool(fn):
             log.exception("tool %s failed", name)
             msg = str(e).strip().splitlines()[0] if str(e).strip() else type(e).__name__
             res, err = f"ERROR in {name}: {type(e).__name__}: {msg[:400]}", True
+        finally:
+            if token is not None:
+                _TAB.reset(token)
         _record_usage(name, res, int((time.monotonic() - t0) * 1000), err)
         return res
 
@@ -1081,6 +1120,76 @@ async def tab_close(tab_id: int | None = None) -> str:
     return f"closed {tid}; current={S.cur}"
 
 
+MANY_MAX = 12  # tabs per open_many / contact_sheet / inspect_posts call
+MANY_PARALLEL = 4  # pages loading at the same time (the browser is one process; more only slows each page down)
+
+
+async def _new_tab() -> int:
+    """Open an empty tab WITHOUT making it the current one; returns its id."""
+    await _ensure()
+    prev = S.cur
+    page = await S.ctx.new_page()
+    pid = None
+    for _ in range(50):  # the 'page' event registers it; wait for that instead of guessing
+        pid = next((i for i, p in S.pages.items() if p is page), None)
+        if pid is not None:
+            break
+        await asyncio.sleep(0.01)
+    if pid is None:
+        raise RuntimeError("new tab was not registered")
+    S.cur = prev if prev in S.pages and not S.pages[prev].is_closed() else pid
+    return pid
+
+
+async def _load_in_tab(pid: int, url: str, settle_ms: int | None = None) -> dict:
+    """Navigate tab `pid` (memory, block detection and pop-up dismissal included) and describe the result."""
+    info: dict = {"tab_id": pid}
+    token = _TAB.set(pid)
+    try:
+        await _navigate(url, None, settle_ms, 0, info)  # retries=0: a retry restarts the browser and would kill every tab
+    except Exception as e:
+        msg = str(e).strip().splitlines()[0] if str(e).strip() else type(e).__name__
+        info["error"] = f"{type(e).__name__}: {msg[:200]}"
+    finally:
+        _TAB.reset(token)
+    return info
+
+
+async def _open_tabs(urls: list[str], parallel: int, settle_ms: int | None) -> list[dict]:
+    """Open each URL in its own new tab, `parallel` at a time. One result per URL, in order; URLs the policy
+    refuses get an error entry and no tab."""
+    if not urls:
+        raise ValueError("urls is empty")
+    if len(urls) > MANY_MAX:
+        raise ValueError(f"at most {MANY_MAX} URLs per call (got {len(urls)})")
+    results: list[dict | None] = [None] * len(urls)
+    jobs = []
+    for i, url in enumerate(urls):
+        if err := _policy_check(url):
+            results[i] = {"url": url, "error": err}
+            continue
+        try:
+            jobs.append((i, await _new_tab(), url))
+        except Exception as e:
+            results[i] = {"url": url, "error": f"could not open a tab: {type(e).__name__}"}
+    sem = asyncio.Semaphore(max(1, min(parallel, 8)))
+
+    async def run(i, pid, url):
+        async with sem:
+            results[i] = await _load_in_tab(pid, url, settle_ms)
+
+    await asyncio.gather(*(run(*j) for j in jobs))
+    return results
+
+
+@tool
+async def open_many(urls: list[str], parallel: int = MANY_PARALLEL, settle_ms: int | None = None) -> str:
+    """Open up to 12 URLs, each in its own new tab, loading `parallel` (default 4, max 8) at a time. Returns JSON
+    [{tab_id, url, status, title, blocked?, error?}]; the current tab does not change. Then read any of them with
+    tab_id= (get_markdown, screenshot, ...), see them all in ONE image with contact_sheet, and close with tab_close."""
+    return _untrusted(json.dumps(await _open_tabs(urls, parallel, settle_ms), ensure_ascii=False))
+
+
 # ---------------------------------------------------------------- navigation
 BLOCK_TITLES = re.compile(
     r"just a moment|attention required|access denied|are you a (?:human|robot)|robot check|captcha|"
@@ -1141,8 +1250,13 @@ async def _dismiss_remembered(page, url: str) -> int:
     return gone_n
 
 
-async def _navigate(url: str, wait_until: str | None = None, settle_ms: int | None = None, retries: int = 0) -> str:
+async def _navigate(
+    url: str, wait_until: str | None = None, settle_ms: int | None = None, retries: int = 0, info: dict | None = None
+) -> str:
+    """Load `url` in the tab this call acts on. `info`, if given, is filled with url/status/title/blocked (or error)."""
     if err := _policy_check(url):
+        if info is not None:
+            info["error"] = err
         return f"ERROR: {err}"
     page = await _ensure()
     known = _mem(MEM.hint, url, _cfg_key()) or ""
@@ -1166,8 +1280,10 @@ async def _navigate(url: str, wait_until: str | None = None, settle_ms: int | No
             await page.wait_for_timeout(settle_ms)
         if err := _policy_check(page.url):  # redirected somewhere not allowed
             await page.goto("about:blank")
+            if info is not None:
+                info["error"] = f"redirected to a disallowed location: {err}"
             return f"ERROR: redirected to a disallowed location: {err}"
-        S.last_snap.pop(S.cur, None)  # a fresh load: the next snapshot is the full list again
+        S.last_snap.pop(_cur_id(), None)  # a fresh load: the next snapshot is the full list again
         title = await page.title()
         status = resp.status if resp else None
         hint = await _detect_block(page, status, title)
@@ -1184,6 +1300,8 @@ async def _navigate(url: str, wait_until: str | None = None, settle_ms: int | No
         await _shutdown()
         page = await _ensure()
     dismissed = 0 if hint else await _dismiss_remembered(page, page.url)
+    if info is not None:
+        info.update(url=page.url, status=status, title=title, blocked=hint or None)
     out = f"{page.url} | status={status if status is not None else '?'} | title={title}"
     if hint:
         out += f" | BLOCKED? {hint}"
@@ -1360,12 +1478,14 @@ SNAP_DEFAULT_ITEMS = 80
 
 
 @tool
-async def snapshot(max_items: int = SNAP_DEFAULT_ITEMS, scope: str = "", diff: bool | None = None) -> str:
+async def snapshot(
+    max_items: int = SNAP_DEFAULT_ITEMS, scope: str = "", diff: bool | None = None, tab_id: int | None = None
+) -> str:
     """List clickable/typeable elements as [ref] tag "label" (use the ref e12 as selector in click/type_text;
     f2e5 = inside iframe #2). Refs stay stable while the page is loaded. scope='#css' limits it to one
     container. diff: None (default) = on a big page you already snapshotted, only the changes are returned;
     True = always changes only; False = always the full list. If the list is cut off it says so: raise
-    max_items or use scope."""
+    max_items or use scope. tab_id= reads another tab without switching to it."""
     return await _snapshot(max_items, scope, diff)
 
 
@@ -1403,8 +1523,9 @@ async def _snapshot(max_items: int, scope: str, diff: bool | None, head: bool = 
             lines.append(f"[{prefix}{it['ref']}] {it['tag']} \"{it['label']}\"{extra}")
         budget -= len(items)
     elements = {ln for ln in lines if ln.startswith("[")}
-    prev_url, prev = S.last_snap.get(S.cur, (None, None))
-    S.last_snap[S.cur] = (url, elements)
+    cid = _cur_id()
+    prev_url, prev = S.last_snap.get(cid, (None, None))
+    S.last_snap[cid] = (url, elements)
     use_diff = diff if diff is not None else (prev is not None and prev_url == url and len(prev) >= SNAP_AUTO_DIFF_MIN)
     top = f"# {title}\n{url}" if head else ""
     if use_diff and prev is not None:
@@ -1428,7 +1549,9 @@ async def _page_markdown(page, selector: str, main_only: bool, links: str) -> st
 
 
 @tool
-async def get_text(selector: str = "body", max_chars: int = DEFAULT_CHARS, offset: int = 0) -> str:
+async def get_text(
+    selector: str = "body", max_chars: int = DEFAULT_CHARS, offset: int = 0, tab_id: int | None = None
+) -> str:
     """Visible text of an element (default whole page), wrapped as untrusted page content. Long text is
     paged: pass offset=N from the 'call again with offset' note to continue."""
     page = await _ensure()
@@ -1436,7 +1559,7 @@ async def get_text(selector: str = "body", max_chars: int = DEFAULT_CHARS, offse
 
 
 @tool
-async def get_html(selector: str = "body", max_chars: int = 8000, offset: int = 0) -> str:
+async def get_html(selector: str = "body", max_chars: int = 8000, offset: int = 0, tab_id: int | None = None) -> str:
     """Outer HTML of an element (untrusted page content). Prefer get_markdown; use this for markup details."""
     page = await _ensure()
     html = await _loc(page, selector).evaluate("e => e.outerHTML")
@@ -1445,7 +1568,8 @@ async def get_html(selector: str = "body", max_chars: int = 8000, offset: int = 
 
 @tool
 async def get_markdown(
-    selector: str = "body", max_chars: int = DEFAULT_CHARS, offset: int = 0, main_only: bool = True, links: str = "keep"
+    selector: str = "body", max_chars: int = DEFAULT_CHARS, offset: int = 0, main_only: bool = True, links: str = "keep",
+    tab_id: int | None = None,
 ) -> str:
     """Page (or element) as compact markdown (untrusted page content). main_only drops menus, footers and
     cookie banners. links: keep | short (no query strings) | none (text only, cheapest). Long pages are
@@ -1455,7 +1579,9 @@ async def get_markdown(
 
 
 @tool
-async def find_in_page(query: str, context: int = 160, max_matches: int = 8, regex: bool = False) -> str:
+async def find_in_page(
+    query: str, context: int = 160, max_matches: int = 8, regex: bool = False, tab_id: int | None = None
+) -> str:
     """Search the page text and return only the matching snippets (with surrounding context and the char
     offset in get_text), far cheaper than reading the whole page. Case-insensitive."""
     page = await _ensure()
@@ -1483,7 +1609,7 @@ async def find_in_page(query: str, context: int = 160, max_matches: int = 8, reg
 
 
 @tool
-async def extract_links(pattern: str = "", limit: int = 100, unique: bool = True) -> str:
+async def extract_links(pattern: str = "", limit: int = 100, unique: bool = True, tab_id: int | None = None) -> str:
     """All links on the page as JSON [{text, href}]. `pattern` is a regex matched on href or text."""
     page = await _ensure()
     links = await page.evaluate(JS_LINKS)
@@ -1501,7 +1627,9 @@ async def extract_links(pattern: str = "", limit: int = 100, unique: bool = True
 
 
 @tool
-async def extract_structured(item_selector: str, fields: dict[str, str], limit: int = 50) -> str:
+async def extract_structured(
+    item_selector: str, fields: dict[str, str], limit: int = 50, tab_id: int | None = None
+) -> str:
     """Extract repeated items (e.g. product cards) as JSON. fields maps name -> 'css' (inner text),
     'css@attr' (attribute) or '@attr' (attribute of the item itself). Example:
     item_selector='li.card', fields={'name':'h2','price':'.price','url':'a@href'}"""
@@ -1530,12 +1658,12 @@ def _shot_fmt(fmt: str) -> str:
 @tool
 async def screenshot(
     selector: str = "", full_page: bool = False, annotate: bool = False, format: str = "", quality: int = 0,
-    max_width: int = -1,
+    max_width: int = -1, tab_id: int | None = None,
 ) -> Image:
     """Screenshot of the page or one element. Images are expensive: prefer snapshot / get_markdown /
     find_in_page and use this only when layout matters. Scaled to 1024px wide (max_width=0 for full size)
     and sent as a quality-55 JPEG (format='png' for lossless; quality 1-100). annotate=True draws snapshot
-    refs (e12) on interactive elements."""
+    refs (e12) on interactive elements. tab_id= shoots another tab without switching to it."""
     fmt = _shot_fmt(format)
     return Image(data=await _shot(selector, full_page, annotate, fmt, quality, max_width), format=fmt)
 
@@ -1600,7 +1728,7 @@ async def _shot(
 @tool
 async def screenshot_file(
     filename: str = "shot.jpg", selector: str = "", full_page: bool = False, annotate: bool = False,
-    format: str = "", quality: int = 0, max_width: int = 0,
+    format: str = "", quality: int = 0, max_width: int = 0, tab_id: int | None = None,
 ) -> str:
     """Like screenshot but saves the image into the output dir at full size (unless max_width is set) and
     returns the path, so no image enters the context. The format follows the extension (.png | .jpg)."""
@@ -1765,7 +1893,7 @@ async def handle_dialog(action: str = "accept") -> str:
 
 
 @tool
-async def evaluate(script: str) -> str:
+async def evaluate(script: str, tab_id: int | None = None) -> str:
     """Run a JS expression or arrow function in the page; result returned as JSON (wrapped as
     untrusted page content). Disabled when CLOAK_ALLOW_EVAL=0."""
     if not POLICY["allow_eval"]:
@@ -1890,7 +2018,7 @@ async def list_network_requests(
     """Recent network responses of the current tab. Filter by URL regex and resource_type
     (xhr|fetch|document|script|image|...). Use the `i` with get_response_body to read an API reply."""
     await _ensure()
-    rows = list(S.net.get(S.cur, []))
+    rows = list(S.net.get(_cur_id(), []))
     if url_pattern:
         rx = re.compile(url_pattern, re.I)
         rows = [r for r in rows if rx.search(r["url"])]
@@ -1983,7 +2111,7 @@ def _walk_ld(node, found):
 
 
 @tool
-async def extract_metadata(max_chars: int = 8000, offset: int = 0) -> str:
+async def extract_metadata(max_chars: int = 8000, offset: int = 0, tab_id: int | None = None) -> str:
     """Structured data embedded in the page: JSON-LD, OpenGraph, microdata and common meta tags, plus a
     'products' summary (name, brand, offers with price/currency/availability) built from schema.org
     Product data. Often more reliable and cheaper than scraping with CSS selectors on shops."""
@@ -1996,7 +2124,7 @@ async def extract_metadata(max_chars: int = 8000, offset: int = 0) -> str:
 
 
 @tool
-async def extract_tables(max_tables: int = 10, max_rows: int = 50) -> str:
+async def extract_tables(max_tables: int = 10, max_rows: int = 50, tab_id: int | None = None) -> str:
     """HTML tables as JSON: [{caption, headers, rows}]."""
     page = await _ensure()
     tables = await page.evaluate(JS_TABLES, [max_tables, max_rows])
